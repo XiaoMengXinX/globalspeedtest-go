@@ -47,7 +47,7 @@ func TestProtocolUserAgent(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if seen != "node-protocol" {
 			t.Fatalf("user agent = %q", seen)
 		}
@@ -64,7 +64,7 @@ func TestProtocolUserAgent(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if seen != "configured" {
 			t.Fatalf("user agent = %q", seen)
 		}
@@ -110,7 +110,7 @@ func TestUserAgent(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	})
 
 	t.Run("CustomUserAgent", func(t *testing.T) {
@@ -121,7 +121,7 @@ func TestUserAgent(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	})
 
 	t.Run("CustomUserAgentAndDoer", func(t *testing.T) {
@@ -136,6 +136,6 @@ func TestUserAgent(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	})
 }

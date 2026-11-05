@@ -80,7 +80,10 @@ func unpadPKCS7(b []byte) ([]byte, error) {
 
 // encryptServerList is the inverse of decryptServerList: it PKCS7-pads the
 // plaintext, encrypts it with DES-ECB and hex-encodes the result in the
-// bundle's serverlist_encrypt.json format.
+// bundle's serverlist_encrypt.json format. It is kept for regenerating the
+// embedded node table.
+//
+//nolint:unused // regeneration helper for serverlist_encrypt.json
 func encryptServerList(plain []byte) (string, error) {
 	block, err := des.NewCipher([]byte(serverListKey))
 	if err != nil {

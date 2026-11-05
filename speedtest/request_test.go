@@ -88,7 +88,7 @@ func TestTCPPingUsesHandshakeAndConfiguredDialer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	unexpected := make(chan error, 2)
 	go func() {
 		for i := 0; i < 2; i++ {

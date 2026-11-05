@@ -42,7 +42,8 @@ func newMeasurementFixture(t *testing.T) (*Speedtest, *Server, *measurementNode)
 		}
 		switch r.URL.Path {
 		case "/speed/dovalid":
-			if r.Method == http.MethodGet {
+			switch r.Method {
+			case http.MethodGet:
 				q := r.URL.Query()
 				bandwidth, _ := strconv.Atoi(q.Get("bandwidth"))
 				if q.Get("imei") != measurementDeviceID || q.Get("key") != "" || !q.Has("key") || q.Get("flag") != "true" || q.Get("model") != "iphone" || q.Get("pkg") != caict.DefaultPkg || bandwidth != 500 || q.Get("token") != caict.ComputeToken("iphone", measurementDeviceID, q.Get("time"), bandwidth) {
@@ -58,8 +59,8 @@ func newMeasurementFixture(t *testing.T) (*Speedtest, *Server, *measurementNode)
 				key := fmt.Sprintf("00000000-0000-4000-8000-%012d", node.issues)
 				node.keys[key] = true
 				node.mu.Unlock()
-				fmt.Fprint(w, "1-"+key)
-			} else if r.Method == http.MethodPost {
+				_, _ = fmt.Fprint(w, "1-"+key)
+			case http.MethodPost:
 				if r.Context().Err() != nil {
 					t.Error("release inherited canceled context")
 				}
@@ -71,8 +72,8 @@ func newMeasurementFixture(t *testing.T) (*Speedtest, *Server, *measurementNode)
 				delete(node.keys, key)
 				node.releases++
 				node.mu.Unlock()
-				fmt.Fprint(w, "0")
-			} else {
+				_, _ = fmt.Fprint(w, "0")
+			default:
 				w.WriteHeader(http.StatusMethodNotAllowed)
 			}
 		case "/speed/File(1G).dl":
@@ -124,7 +125,7 @@ func newMeasurementFixture(t *testing.T) (*Speedtest, *Server, *measurementNode)
 			}
 			node.uploaded.Add(n)
 			_ = waitProbe(r.Context(), time.Millisecond)
-			fmt.Fprint(w, "0")
+			_, _ = fmt.Fprint(w, "0")
 		default:
 			http.NotFound(w, r)
 		}
@@ -224,7 +225,7 @@ func TestBackendMeasurementRejectsResponses(t *testing.T) {
 					requests.Add(1)
 					_, _ = io.Copy(io.Discard, r.Body)
 					w.WriteHeader(http.StatusForbidden)
-					fmt.Fprint(w, "rejected")
+					_, _ = fmt.Fprint(w, "rejected")
 					return true
 				}
 				return false
@@ -255,7 +256,7 @@ func TestBackendSessionRequiresCanonicalSuccess(t *testing.T) {
 			client, target, node := newMeasurementFixture(t)
 			node.hook = func(w http.ResponseWriter, r *http.Request) bool {
 				if r.URL.Path == "/speed/dovalid" && r.Method == http.MethodGet {
-					fmt.Fprint(w, answer)
+					_, _ = fmt.Fprint(w, answer)
 					return true
 				}
 				return false
@@ -352,7 +353,7 @@ func TestBackendMultiMeasurementCleansUpFailedAcquisition(t *testing.T) {
 	_, second, other := newMeasurementFixture(t)
 	second.Context = client
 	client.SetNThread(2)
-	other.hook = func(w http.ResponseWriter, r *http.Request) bool { fmt.Fprint(w, "0"); return true }
+	other.hook = func(w http.ResponseWriter, r *http.Request) bool { _, _ = fmt.Fprint(w, "0"); return true }
 	if err := main.MultiDownloadTestContext(context.Background(), Servers{main, second}); !errors.Is(err, caict.ErrBusy) {
 		t.Fatalf("error=%v", err)
 	}
@@ -374,10 +375,10 @@ func TestBackendMeasurementUsesConfiguredProxy(t *testing.T) {
 		clone.RequestURI = ""
 		resp, err := forward.RoundTrip(clone)
 		if err != nil {
-			http.Error(w, "proxy", 502)
+			http.Error(w, "proxy", http.StatusBadGateway)
 			return
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		for key, values := range resp.Header {
 			for _, value := range values {
 				w.Header().Add(key, value)

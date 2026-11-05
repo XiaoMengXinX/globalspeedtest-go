@@ -155,8 +155,10 @@ func (dm *DataManager) SetCallbackUpload(callback func(upRate ByteRate)) {
 }
 
 func (dm *DataManager) Wait() {
+	// Block until the in-flight phase releases lifecycle, which StartContext
+	// holds for the whole measurement window.
 	dm.lifecycle.Lock()
-	dm.lifecycle.Unlock()
+	dm.lifecycle.Unlock() //nolint:staticcheck // intentional barrier on the lifecycle mutex
 }
 
 func (dm *DataManager) PrepareDownload() {

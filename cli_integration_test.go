@@ -44,10 +44,10 @@ func newCLIFixture(t *testing.T) *cliFixture {
 	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/dataServer/getIpLocSP.php":
-			io.WriteString(w, `192.0.2.10|["中国","辽宁","大连","","联通"]|2|联通|100`)
+			_, _ = io.WriteString(w, `192.0.2.10|["中国","辽宁","大连","","联通"]|2|联通|100`)
 		case "/dataServer/mobilematch_many.php":
 			host, port, _ := net.SplitHostPort(r.Host)
-			json.NewEncoder(w).Encode([]map[string]string{{
+			_ = json.NewEncoder(w).Encode([]map[string]string{{
 				"hostid": "12341", "hostip": host, "port": port, "hostname": "大连测试节点",
 				"pname": "辽宁", "city": "大连", "oper": "联通",
 			}})
@@ -57,7 +57,7 @@ func newCLIFixture(t *testing.T) *cliFixture {
 			defer f.mu.Unlock()
 			if r.Method == http.MethodPost {
 				f.releases++
-				io.WriteString(w, "0")
+				_, _ = io.WriteString(w, "0")
 				return
 			}
 			if q.Get("key") != "" {
@@ -65,14 +65,14 @@ func newCLIFixture(t *testing.T) *cliFixture {
 				return
 			}
 			var band int
-			fmt.Sscanf(q.Get("bandwidth"), "%d", &band)
+			_, _ = fmt.Sscanf(q.Get("bandwidth"), "%d", &band)
 			if q.Get("token") != caict.ComputeToken(q.Get("model"), q.Get("imei"), q.Get("time"), band) {
 				f.badToken = true
-				io.WriteString(w, "-1-")
+				_, _ = io.WriteString(w, "-1-")
 				return
 			}
 			f.issues++
-			io.WriteString(w, "1-01234567-89ab-4cde-8f01-23456789abcd")
+			_, _ = io.WriteString(w, "1-01234567-89ab-4cde-8f01-23456789abcd")
 		case "/speed/File(1G).dl":
 			select {
 			case f.download <- struct{}{}:
@@ -98,9 +98,9 @@ func newCLIFixture(t *testing.T) *cliFixture {
 			if _, err := io.Copy(io.Discard, r.Body); err != nil {
 				return
 			}
-			io.WriteString(w, "0")
+			_, _ = io.WriteString(w, "0")
 		case "/":
-			io.WriteString(w, "ok")
+			_, _ = io.WriteString(w, "ok")
 		default:
 			http.NotFound(w, r)
 		}
@@ -220,18 +220,18 @@ func newSpeedNode(t *testing.T, downloadStatus int, pingDelay time.Duration) (*h
 			defer mu.Unlock()
 			if r.Method == http.MethodPost {
 				releases++
-				io.WriteString(w, "0")
+				_, _ = io.WriteString(w, "0")
 				return
 			}
 			var band int
-			fmt.Sscanf(r.URL.Query().Get("bandwidth"), "%d", &band)
+			_, _ = fmt.Sscanf(r.URL.Query().Get("bandwidth"), "%d", &band)
 			q := r.URL.Query()
 			if q.Get("token") != caict.ComputeToken(q.Get("model"), q.Get("imei"), q.Get("time"), band) {
-				io.WriteString(w, "-1-")
+				_, _ = io.WriteString(w, "-1-")
 				return
 			}
 			issues++
-			io.WriteString(w, "1-01234567-89ab-4cde-8f01-23456789abcd")
+			_, _ = io.WriteString(w, "1-01234567-89ab-4cde-8f01-23456789abcd")
 		case "/speed/File(1G).dl":
 			if downloadStatus != http.StatusOK {
 				w.WriteHeader(downloadStatus)
@@ -254,12 +254,12 @@ func newSpeedNode(t *testing.T, downloadStatus int, pingDelay time.Duration) (*h
 				return
 			}
 			_, _ = io.Copy(io.Discard, r.Body)
-			io.WriteString(w, "0")
+			_, _ = io.WriteString(w, "0")
 		default:
 			if pingDelay > 0 {
 				time.Sleep(pingDelay)
 			}
-			io.WriteString(w, "ok")
+			_, _ = io.WriteString(w, "ok")
 		}
 	}))
 	t.Cleanup(srv.Close)
@@ -276,9 +276,9 @@ func TestCLIFallsBackToNextServer(t *testing.T) {
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/dataServer/getIpLocSP.php":
-			io.WriteString(w, `192.0.2.10|["中国","辽宁","大连","","联通"]|2|联通|100`)
+			_, _ = io.WriteString(w, `192.0.2.10|["中国","辽宁","大连","","联通"]|2|联通|100`)
 		case "/dataServer/mobilematch_many.php":
-			json.NewEncoder(w).Encode([]map[string]string{nodeEntry("bad", bad), nodeEntry("good", good)})
+			_ = json.NewEncoder(w).Encode([]map[string]string{nodeEntry("bad", bad), nodeEntry("good", good)})
 		default:
 			http.NotFound(w, r)
 		}

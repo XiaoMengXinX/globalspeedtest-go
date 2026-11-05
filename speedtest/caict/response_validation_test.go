@@ -39,7 +39,7 @@ func validationRawServer(t *testing.T, serve func(net.Conn)) Server {
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
 		if _, err := http.ReadRequest(bufio.NewReader(conn)); err != nil {
 			t.Errorf("read test request: %v", err)

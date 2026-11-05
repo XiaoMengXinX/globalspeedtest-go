@@ -102,7 +102,7 @@ func (s *Server) issueSession(ctx context.Context) (nodeSession, error) {
 	if err != nil {
 		return nodeSession{}, nodeRequestError(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return nodeSession{}, fmt.Errorf("session request: HTTP %d", resp.StatusCode)
 	}
@@ -144,7 +144,7 @@ func (s *Server) releaseSession(session nodeSession) error {
 	if err != nil {
 		return nodeRequestError(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)); err != nil {
 		return err
 	}
@@ -314,7 +314,7 @@ func downloadRequest(ctx context.Context, s *Server, _ int) error {
 	if err != nil {
 		return nodeRequestError(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return fmt.Errorf("download request: HTTP %d", resp.StatusCode)
 	}
@@ -375,7 +375,7 @@ func uploadRequest(ctx context.Context, s *Server, w int) error {
 	if err != nil {
 		return nodeRequestError(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("upload request: HTTP %d", resp.StatusCode)
 	}
@@ -388,12 +388,6 @@ func uploadRequest(ctx context.Context, s *Server, w int) error {
 	s.Context.AddTotalUpload(size)
 	return nil
 }
-
-// TCPTest uses the node's HTTP service for throughput.
-func tcpDownloadRequest(ctx context.Context, s *Server, w int) error {
-	return downloadRequest(ctx, s, w)
-}
-func tcpUploadRequest(ctx context.Context, s *Server, w int) error { return uploadRequest(ctx, s, w) }
 
 func tcpHost(s *Server) (string, error) {
 	u, err := url.Parse(s.URL)
@@ -544,7 +538,7 @@ func (s *Server) HTTPPing(ctx context.Context, echoTimes int, echoFreq time.Dura
 		if err != nil {
 			return nodeRequestError(err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode >= 500 {
 			return fmt.Errorf("ping request: HTTP %d", resp.StatusCode)
 		}
@@ -568,7 +562,7 @@ func (s *Server) ICMPPing(ctx context.Context, readTimeout time.Duration, echoTi
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 	packet := make([]byte, 8+echoOptionDataSize)

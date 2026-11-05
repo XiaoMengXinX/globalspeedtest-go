@@ -24,15 +24,15 @@ func discoveryFixture(t *testing.T) (*Speedtest, *httptest.Server) {
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/dataServer/getIpLocSP.php":
-			fmt.Fprint(w, fixtureLocation)
+			_, _ = fmt.Fprint(w, fixtureLocation)
 		case "/dataServer/mobilematch_many.php":
 			host, port, _ := net.SplitHostPort(server.Listener.Addr().String())
-			json.NewEncoder(w).Encode([]map[string]string{{
+			_ = json.NewEncoder(w).Encode([]map[string]string{{
 				"hostid": "900001", "hostname": "本地测试节点", "hostip": host, "port": port,
 				"pname": "测试省", "city": "测试市", "oper": "测试运营商",
 			}})
 		default:
-			fmt.Fprint(w, "ok")
+			_, _ = fmt.Fprint(w, "ok")
 		}
 	}))
 	t.Cleanup(server.Close)
@@ -51,7 +51,7 @@ func TestDiscoveryConcurrentCache(t *testing.T) {
 			if r.URL.Query().Get("mac") != "TS0000000000000000" || r.URL.Query().Get("tag") != "ios" {
 				t.Errorf("location query = %v", r.URL.Query())
 			}
-			fmt.Fprint(w, fixtureLocation)
+			_, _ = fmt.Fprint(w, fixtureLocation)
 		case "/dataServer/mobilematch_many.php":
 			registries.Add(1)
 			for key, want := range map[string]string{
@@ -62,7 +62,7 @@ func TestDiscoveryConcurrentCache(t *testing.T) {
 					t.Errorf("%s = %q, want %q", key, got, want)
 				}
 			}
-			fmt.Fprint(w, `[{"hostid":900001,"hostname":"本地节点","hostip":"127.0.0.1","port":8080}]`)
+			_, _ = fmt.Fprint(w, `[{"hostid":900001,"hostname":"本地节点","hostip":"127.0.0.1","port":8080}]`)
 		default:
 			t.Errorf("unexpected request %s", r.URL)
 		}
@@ -98,10 +98,10 @@ func TestDiscoveryConcurrentCache(t *testing.T) {
 func TestDiscoveryNodeValidation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/dataServer/getIpLocSP.php" {
-			fmt.Fprint(w, fixtureLocation)
+			_, _ = fmt.Fprint(w, fixtureLocation)
 			return
 		}
-		fmt.Fprint(w, `[
+		_, _ = fmt.Fprint(w, `[
 			{"hostid":900001,"hostname":"IPv6","hostip":"2001:db8::1","port":8080,"oper":"测试"},
 			{"hostid":"900002","hostname":"duplicate address","hostip":"[2001:db8::1]","port":"8080"},
 			{"hostid":"900001","hostname":"duplicate ID","hostip":"192.0.2.1","port":"8080"},
@@ -134,10 +134,10 @@ func TestDiscoveryFiltersBeforePing(t *testing.T) {
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/dataServer/getIpLocSP.php":
-			fmt.Fprint(w, fixtureLocation)
+			_, _ = fmt.Fprint(w, fixtureLocation)
 		case "/dataServer/mobilematch_many.php":
 			host, port, _ := net.SplitHostPort(server.Listener.Addr().String())
-			json.NewEncoder(w).Encode([]map[string]string{
+			_ = json.NewEncoder(w).Encode([]map[string]string{
 				{"hostid": "900001", "hostname": "北京节点", "hostip": host, "port": port, "pname": "北京", "city": "北京", "oper": "测试"},
 				{"hostid": "900002", "hostname": "上海节点", "hostip": "192.0.2.2", "port": port, "pname": "上海", "city": "上海", "oper": "其他"},
 			})
@@ -195,10 +195,10 @@ func TestDiscoveryFallback(t *testing.T) {
 		t.Run(response, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/dataServer/getIpLocSP.php" {
-					fmt.Fprint(w, fixtureLocation)
+					_, _ = fmt.Fprint(w, fixtureLocation)
 					return
 				}
-				fmt.Fprint(w, response)
+				_, _ = fmt.Fprint(w, response)
 			}))
 			defer server.Close()
 			client := New(WithUserConfig(&UserConfig{ControlURL: server.URL}))
@@ -256,7 +256,10 @@ func TestControlResponseValidation(t *testing.T) {
 		{"invalid region", http.StatusOK, `192.0.2.1|invalid|1|测试`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(tc.status); fmt.Fprint(w, tc.body) }))
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = fmt.Fprint(w, tc.body)
+			}))
 			defer server.Close()
 			client := New(WithUserConfig(&UserConfig{ControlURL: server.URL}))
 			if user, err := client.FetchUserInfo(); err == nil || user != nil {

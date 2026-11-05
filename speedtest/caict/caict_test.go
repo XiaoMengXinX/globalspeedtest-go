@@ -100,7 +100,7 @@ func TestMockRejectsUnknownKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 	srv := m.Server()
 
 	// fabricated key → "-1-" rejection, matching production
@@ -122,7 +122,7 @@ func TestEndToEndAgainstMock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 	srv := m.Server()
 	sess := DefaultSession(500)
 	ctx := context.Background()

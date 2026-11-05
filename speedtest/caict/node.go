@@ -118,7 +118,7 @@ func httpGetString(ctx context.Context, rawURL, ua string) (string, error) {
 		}
 		return "", fmt.Errorf("caict: node request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("caict: node answered HTTP %d", resp.StatusCode)
 	}
@@ -241,7 +241,7 @@ func DownloadTest(ctx context.Context, srv Server, sess Session, threads int, du
 								line := strings.SplitN(string(acc[:i]), "\r\n", 2)[0]
 								code := 0
 								if fs := strings.Fields(line); len(fs) >= 2 {
-									fmt.Sscanf(fs[1], "%d", &code)
+									_, _ = fmt.Sscanf(fs[1], "%d", &code)
 								}
 								if code < 200 || code >= 400 {
 									status.Store(int32(code))

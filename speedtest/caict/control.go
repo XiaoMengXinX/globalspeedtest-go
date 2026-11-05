@@ -114,7 +114,7 @@ func (c *ControlPlane) get(ctx context.Context, rawurl string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	return string(body), nil
 }
@@ -318,7 +318,7 @@ func DownloadProbe(ctx context.Context, srv Server, key string, n int64) (total 
 	if err != nil {
 		return 0, 0, err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 	deadline, _ := ctx.Deadline()
