@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -209,7 +210,7 @@ func TestCLICancelReleasesSession(t *testing.T) {
 	}
 }
 
-func newSpeedNode(t *testing.T, downloadStatus int, pingDelay time.Duration) (*httptest.Server, func() (issues, releases int)) {
+func newSpeedNode(t *testing.T, downloadStatus, uploadStatus int, pingDelay time.Duration) (*httptest.Server, func() (issues, releases int)) {
 	t.Helper()
 	var mu sync.Mutex
 	var issues, releases int
@@ -253,6 +254,10 @@ func newSpeedNode(t *testing.T, downloadStatus int, pingDelay time.Duration) (*h
 				http.Error(w, "missing session", http.StatusForbidden)
 				return
 			}
+			if uploadStatus != http.StatusOK {
+				w.WriteHeader(uploadStatus)
+				return
+			}
 			_, _ = io.Copy(io.Discard, r.Body)
 			_, _ = io.WriteString(w, "0")
 		default:
@@ -266,19 +271,22 @@ func newSpeedNode(t *testing.T, downloadStatus int, pingDelay time.Duration) (*h
 	return srv, func() (int, int) { mu.Lock(); defer mu.Unlock(); return issues, releases }
 }
 
-func TestCLIFallsBackToNextServer(t *testing.T) {
-	bad, badStats := newSpeedNode(t, http.StatusForbidden, 0)
-	good, goodStats := newSpeedNode(t, http.StatusOK, 30*time.Millisecond)
-	nodeEntry := func(id string, srv *httptest.Server) map[string]string {
+// runCLIOnNodes runs an auto-selecting measurement over the nodes, listed
+// lowest latency first.
+func runCLIOnNodes(t *testing.T, nodes ...*httptest.Server) ([]byte, error) {
+	t.Helper()
+	var entries []map[string]string
+	for i, srv := range nodes {
 		host, port, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
-		return map[string]string{"hostid": id, "hostip": host, "port": port, "hostname": id, "pname": "辽宁", "city": "大连", "oper": "联通"}
+		id := strconv.Itoa(i + 1)
+		entries = append(entries, map[string]string{"hostid": id, "hostip": host, "port": port, "hostname": id, "pname": "辽宁", "city": "大连", "oper": "联通"})
 	}
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/dataServer/getIpLocSP.php":
 			_, _ = io.WriteString(w, `192.0.2.10|["中国","辽宁","大连","","联通"]|2|联通|100`)
 		case "/dataServer/mobilematch_many.php":
-			_ = json.NewEncoder(w).Encode([]map[string]string{nodeEntry("bad", bad), nodeEntry("good", good)})
+			_ = json.NewEncoder(w).Encode(entries)
 		default:
 			http.NotFound(w, r)
 		}
@@ -289,7 +297,13 @@ func TestCLIFallsBackToNextServer(t *testing.T) {
 	args := []string{"--control-url", control.URL, "--thread", "1", "--duration", "300ms", "--unix"}
 	cmd.Env = append(os.Environ(), "GLOBALSPEEDTEST_CLI_TEST=1", "GLOBALSPEEDTEST_CLI_ARGS="+strings.Join(args, "\n"))
 	cmd.WaitDelay = 5 * time.Second
-	out, err := cmd.CombinedOutput()
+	return cmd.CombinedOutput()
+}
+
+func TestCLIFallsBackToNextServer(t *testing.T) {
+	bad, badStats := newSpeedNode(t, http.StatusForbidden, http.StatusOK, 0)
+	good, goodStats := newSpeedNode(t, http.StatusOK, http.StatusOK, 30*time.Millisecond)
+	out, err := runCLIOnNodes(t, bad, good)
 	if err != nil {
 		t.Fatalf("run: %v\n%s", err, out)
 	}
@@ -303,5 +317,20 @@ func TestCLIFallsBackToNextServer(t *testing.T) {
 	goodIssues, goodReleases := goodStats()
 	if goodIssues < 1 || goodReleases < 1 {
 		t.Fatalf("good node issues=%d releases=%d", goodIssues, goodReleases)
+	}
+}
+
+func TestCLIKeepsServerThatDeliveredData(t *testing.T) {
+	first, _ := newSpeedNode(t, http.StatusOK, http.StatusForbidden, 0)
+	second, secondStats := newSpeedNode(t, http.StatusOK, http.StatusOK, 30*time.Millisecond)
+	out, err := runCLIOnNodes(t, first, second)
+	if err == nil {
+		t.Fatalf("the failed upload was not reported\n%s", out)
+	}
+	if bytes.Contains(out, []byte("Switching to the next server")) {
+		t.Fatalf("switched servers after the download\n%s", out)
+	}
+	if issues, _ := secondStats(); issues != 0 {
+		t.Fatalf("second node issues=%d", issues)
 	}
 }

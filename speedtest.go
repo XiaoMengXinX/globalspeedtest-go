@@ -196,8 +196,8 @@ func runSpeedtest(ctx context.Context) error {
 }
 
 // measureWithFallback measures the lowest-latency server and, when a server
-// fails, advances to the next candidate by latency. It returns the server
-// that produced a result.
+// fails before it has delivered any data, advances to the next candidate by
+// latency. It returns the server that produced a result.
 func measureWithFallback(ctx context.Context, tm *TaskManager, client *speedtest.Speedtest, servers speedtest.Servers) (speedtest.Servers, error) {
 	candidates := *servers.Available()
 	if len(candidates) == 0 {
@@ -212,6 +212,11 @@ func measureWithFallback(ctx context.Context, tm *TaskManager, client *speedtest
 			return nil, err
 		}
 		if err := measureServer(ctx, tm, client, server, servers); err != nil {
+			// Once the server has delivered data it works, and a later failure,
+			// such as a weak uplink, would follow the measurement to any server.
+			if client.GetTotalDownload() > 0 || client.GetTotalUpload() > 0 {
+				return nil, err
+			}
 			lastErr = err
 			client.Reset()
 			if i < len(candidates)-1 {
