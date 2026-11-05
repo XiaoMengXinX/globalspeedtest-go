@@ -1,11 +1,7 @@
 package speedtest
 
 import (
-	"context"
-	"fmt"
-	"io"
-	"net/http"
-	"net/http/httptest"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -55,6 +51,19 @@ func TestDataManager_GetAvgDownloadRate(t *testing.T) {
 	}
 }
 
+func TestDataManager_AverageRateUsesSeconds(t *testing.T) {
+	dm := NewDataManager()
+	dm.SetCaptureTime(1500 * time.Microsecond)
+	dm.AddTotalDownload(123)
+	dm.AddTotalUpload(123)
+	want := float64(123) * 8 / 1e6 / 0.0015
+	for _, got := range []float64{dm.GetAvgDownloadRate(), dm.GetAvgUploadRate()} {
+		if math.Abs(got-want) > 1e-12 {
+			t.Fatalf("average rate = %g, want %g", got, want)
+		}
+	}
+}
+
 func TestDataManager_GetUploadConfirmationRatio(t *testing.T) {
 	dm := NewDataManager()
 	dm.upload.AddTotalReadVolume(2 * 1000 * 1000)
@@ -69,6 +78,9 @@ func TestDataManager_GetUploadConfirmationRatio(t *testing.T) {
 	dm.AddTotalUpload(3 * 1000 * 1000)
 	if got := dm.GetUploadConfirmationRatio(); got != 1 {
 		t.Fatalf("got confirmation ratio %v, want 1 after clamping", got)
+	}
+	if got := dm.GetUploadBacklog(); got != 0 {
+		t.Fatalf("got upload backlog %d, want 0", got)
 	}
 }
 
@@ -96,133 +108,41 @@ func TestReducedUploadWorkerCount(t *testing.T) {
 	}
 }
 
-func TestUploadRequestCountsOnlyConfirmedUploads(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, err := io.Copy(io.Discard, r.Body); err != nil {
-			t.Errorf("failed to read upload: %v", err)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	client := New()
-	target := &Server{URL: server.URL, Context: client}
-	if err := uploadRequest(context.Background(), target, 0); err != nil {
-		t.Fatalf("upload request failed: %v", err)
-	}
-
-	want := int64(ulSizes[0]*100-51) * 10
-	if got := client.GetTotalUpload(); got != want {
-		t.Fatalf("counted %d bytes, want %d", got, want)
+func TestSampleVarianceSingleton(t *testing.T) {
+	mean, variance, stdDev, min, max := sampleVariance([]int64{42})
+	if mean != 42 || variance != 0 || stdDev != 0 || min != 42 || max != 42 {
+		t.Fatalf("singleton statistics = %d, %d, %d, %d, %d", mean, variance, stdDev, min, max)
 	}
 }
 
-func TestResolveUploadURLFollowsTemporaryRedirect(t *testing.T) {
-	var received int64
-	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		if r.Method != http.MethodPost {
-			t.Errorf("request method is %s, want POST", r.Method)
-		}
-		var err error
-		received, err = io.Copy(io.Discard, r.Body)
-		if err != nil {
-			t.Errorf("failed to read redirected upload: %v", err)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer targetServer.Close()
-
-	redirectServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, targetServer.URL, http.StatusTemporaryRedirect)
-	}))
-	defer redirectServer.Close()
-
-	client := New()
-	target := &Server{URL: redirectServer.URL, Context: client}
-	target.resolveUploadURL(context.Background())
-	if target.URL != targetServer.URL {
-		t.Fatalf("resolved upload URL is %q, want %q", target.URL, targetServer.URL)
+func TestDataManager_ResetSnapshots(t *testing.T) {
+	dm := NewDataManager()
+	store := dm.Snapshots()
+	chunk := dm.NewChunk()
+	current := dm.Snapshot
+	dm.AddTotalDownload(123)
+	dm.AddTotalUpload(456)
+	dm.Reset()
+	if dm.Snapshots() != store || store.Latest() != current {
+		t.Fatal("reset did not archive the current snapshot in the existing store")
 	}
-	if err := uploadRequest(context.Background(), target, 0); err != nil {
-		t.Fatalf("upload request failed: %v", err)
+	if len(*store.Latest()) != 1 || (*store.Latest())[0] != chunk {
+		t.Fatal("archived snapshot lost its chunk")
 	}
-
-	want := int64(ulSizes[0]*100-51) * 10
-	if received != want {
-		t.Fatalf("resolved endpoint received %d bytes, want %d", received, want)
+	if dm.Snapshot == current || len(*dm.Snapshot) != 0 {
+		t.Fatal("reset did not start an empty snapshot")
 	}
-	if got := client.GetTotalUpload(); got != want {
-		t.Fatalf("counted %d upload bytes, want %d", got, want)
+	if dm.GetTotalDownload() != 0 || dm.GetTotalUpload() != 0 {
+		t.Fatal("reset retained transfer counters")
 	}
-}
-
-func TestUploadRequestDoesNotCountRejectedUploads(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(io.Discard, r.Body)
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
-	client := New()
-	target := &Server{URL: server.URL, Context: client}
-	if err := uploadRequest(context.Background(), target, 0); err == nil {
-		t.Fatal("expected upload request to fail")
+	for range maxSnapshotSize + 2 {
+		dm.Reset()
 	}
-	if got := client.GetTotalUpload(); got != 0 {
-		t.Fatalf("counted %d bytes for a rejected upload", got)
+	if len(store.All()) != maxSnapshotSize {
+		t.Fatalf("snapshot history size = %d, want %d", len(store.All()), maxSnapshotSize)
 	}
-}
-
-func TestDynamicRate(t *testing.T) {
-
-	server, _ := CustomServer("http://shenzhen.cmcc.speedtest.shunshiidc.com:8080/speedtest/upload.php")
-	//server, _ := CustomServer("http://192.168.5.237:8080/speedtest/upload.php")
-
-	oldDownTotal := server.Context.GetTotalDownload()
-	oldUpTotal := server.Context.GetTotalUpload()
-
-	server.Context.SetRateCaptureFrequency(time.Millisecond * 100)
-	server.Context.SetCaptureTime(time.Second)
-	go func() {
-		for i := 0; i < 2; i++ {
-			time.Sleep(time.Second)
-			newDownTotal := server.Context.GetTotalDownload()
-			newUpTotal := server.Context.GetTotalUpload()
-
-			downRate := float64(newDownTotal-oldDownTotal) * 8 / 1000 / 1000
-			upRate := float64(newUpTotal-oldUpTotal) * 8 / 1000 / 1000
-			oldDownTotal = newDownTotal
-			oldUpTotal = newUpTotal
-			fmt.Printf("downRate: %.2fMbps | upRate: %.2fMbps\n", downRate, upRate)
-		}
-	}()
-
-	err := server.DownloadTest()
-	if err != nil {
-		fmt.Println("Warning: not found server")
-		//t.Error(err)
-	}
-
-	server.Context.Wait()
-
-	err = server.UploadTest()
-	if err != nil {
-		fmt.Println("Warning: not found server")
-		//t.Error(err)
-	}
-
-	fmt.Printf(" \n")
-
-	fmt.Printf("Download: %5.2f Mbit/s\n", server.DLSpeed)
-	fmt.Printf("Upload: %5.2f Mbit/s\n\n", server.ULSpeed)
-	valid := server.CheckResultValid()
-	if !valid {
-		fmt.Println("Warning: result seems to be wrong. Please test again.")
+	store.Clean()
+	if store.Latest() != nil || len(store.All()) != 0 {
+		t.Fatal("clean retained snapshot history")
 	}
 }

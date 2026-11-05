@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/showwin/speedtest-go/speedtest/internal"
 	"io"
 	"math"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/XiaoMengXinX/globalspeedtest-go/speedtest/internal"
 )
 
 type Manager interface {
@@ -35,6 +36,8 @@ type Manager interface {
 	SetCallbackDownload(callback func(downRate ByteRate))
 	SetCallbackUpload(callback func(upRate ByteRate))
 
+	PrepareDownload()
+	PrepareUpload()
 	RegisterDownloadHandler(fn func()) *TestDirection
 	RegisterUploadHandler(fn func()) *TestDirection
 
@@ -44,6 +47,7 @@ type Manager interface {
 	Snapshots() *Snapshots
 
 	SetNThread(n int) Manager
+	WorkerLimit(upload bool) int
 }
 
 type Chunk interface {
@@ -91,6 +95,7 @@ type DataManager struct {
 	nThread              int
 	uploadMaxWorkers     int
 
+	lifecycle sync.Mutex
 	running   bool
 	runningRW sync.RWMutex
 
@@ -99,6 +104,7 @@ type DataManager struct {
 }
 
 type TestDirection struct {
+	mu              sync.RWMutex
 	TestType        int                         // test type
 	manager         *DataManager                // manager
 	totalDataVolume int64                       // total send/receive data volume
@@ -137,46 +143,69 @@ func NewDataManager() *DataManager {
 }
 
 func (dm *DataManager) SetCallbackDownload(callback func(downRate ByteRate)) {
-	if dm.download != nil {
-		dm.download.captureCallback = callback
-	}
+	dm.download.mu.Lock()
+	dm.download.captureCallback = callback
+	dm.download.mu.Unlock()
 }
 
 func (dm *DataManager) SetCallbackUpload(callback func(upRate ByteRate)) {
-	if dm.upload != nil {
-		dm.upload.captureCallback = callback
-	}
+	dm.upload.mu.Lock()
+	dm.upload.captureCallback = callback
+	dm.upload.mu.Unlock()
 }
 
 func (dm *DataManager) Wait() {
-	oldDownTotal := dm.GetTotalDownload()
-	oldUpTotal := dm.GetTotalUpload()
-	for {
-		time.Sleep(dm.rateCaptureFrequency)
-		newDownTotal := dm.GetTotalDownload()
-		newUpTotal := dm.GetTotalUpload()
-		deltaDown := newDownTotal - oldDownTotal
-		deltaUp := newUpTotal - oldUpTotal
-		oldDownTotal = newDownTotal
-		oldUpTotal = newUpTotal
-		if deltaDown == 0 && deltaUp == 0 {
-			return
-		}
-	}
+	dm.lifecycle.Lock()
+	dm.lifecycle.Unlock()
+}
+
+func (dm *DataManager) PrepareDownload() {
+	dm.lifecycle.Lock()
+	defer dm.lifecycle.Unlock()
+	dm.download.prepare()
+}
+
+func (dm *DataManager) PrepareUpload() {
+	dm.lifecycle.Lock()
+	defer dm.lifecycle.Unlock()
+	dm.upload.prepare()
+}
+
+func (td *TestDirection) prepare() {
+	td.mu.Lock()
+	defer td.mu.Unlock()
+	td.fns = nil
+	td.resetMeasurements()
+}
+
+func (td *TestDirection) resetMeasurements() {
+	atomic.StoreInt64(&td.totalDataVolume, 0)
+	atomic.StoreInt64(&td.totalReadVolume, 0)
+	atomic.StoreInt32(&td.activeWorkers, 0)
+	atomic.StoreInt32(&td.maxWorkers, 0)
+	td.RateSequence = nil
+	td.welford = nil
+	td.closeFunc = nil
 }
 
 func (dm *DataManager) RegisterUploadHandler(fn func()) *TestDirection {
-	if len(dm.upload.fns) < dm.nThread {
-		dm.upload.Add(fn)
-	}
-	return dm.upload
+	return dm.registerHandler(dm.upload, fn)
 }
 
 func (dm *DataManager) RegisterDownloadHandler(fn func()) *TestDirection {
-	if len(dm.download.fns) < dm.nThread {
-		dm.download.Add(fn)
+	return dm.registerHandler(dm.download, fn)
+}
+
+func (dm *DataManager) registerHandler(td *TestDirection, fn func()) *TestDirection {
+	dm.Lock()
+	limit := dm.nThread
+	dm.Unlock()
+	td.mu.Lock()
+	if len(td.fns) < limit {
+		td.Add(fn)
 	}
-	return dm.download
+	td.mu.Unlock()
+	return td
 }
 
 func (td *TestDirection) GetTotalDataVolume() int64 {
@@ -196,100 +225,111 @@ func (td *TestDirection) AddTotalReadVolume(delta int64) int64 {
 }
 
 func (td *TestDirection) Start(cancel context.CancelFunc, mainRequestHandlerIndex int) {
-	if len(td.fns) == 0 {
-		panic("empty task stack")
-	}
-	if mainRequestHandlerIndex > len(td.fns)-1 {
-		mainRequestHandlerIndex = 0
-	}
-	mainLoadFactor := 0.1
-	workerLimit := td.manager.nThread
-	if td.TestType == typeUpload && td.manager.uploadMaxWorkers < workerLimit {
-		workerLimit = td.manager.uploadMaxWorkers
-	}
-	// When the number of processor cores is equivalent to the processing program,
-	// the processing efficiency reaches the highest level (VT is not considered).
-	mainN := int(mainLoadFactor * float64(len(td.fns)))
-	if mainN == 0 {
-		mainN = 1
-	}
-	if len(td.fns) == 1 {
-		mainN = workerLimit
-	}
-	auxN := workerLimit - mainN
-	dbg.Printf("Available fns: %d\n", len(td.fns))
-	dbg.Printf("mainN: %d\n", mainN)
-	dbg.Printf("auxN: %d\n", auxN)
-	wg := sync.WaitGroup{}
-	td.manager.running = true
-	stopCapture := td.rateCapture()
-	td.maxWorkers = int32(workerLimit)
-	initialWorkers := td.maxWorkers
-	if td.TestType == typeUpload {
-		if td.manager.uploadMaxWorkers <= 8 {
-			initialWorkers = int32(runtime.NumCPU())
-			if initialWorkers > td.maxWorkers {
-				initialWorkers = td.maxWorkers
-			}
-		}
-	}
-	atomic.StoreInt32(&td.activeWorkers, initialWorkers)
-	if td.TestType == typeUpload {
-		dbg.Printf("Upload workers: %d/%d\n", initialWorkers, td.maxWorkers)
-	}
-
-	// refresh once function
-	once := sync.Once{}
-	td.closeFunc = func() {
-		once.Do(func() {
-			stopCapture <- true
-			close(stopCapture)
-			td.manager.runningRW.Lock()
-			td.manager.running = false
-			td.manager.runningRW.Unlock()
-			cancel()
-			dbg.Println("FuncGroup: Stop")
-		})
-	}
-
-	if td.TestType == typeUpload && td.maxWorkers > 1 {
-		go td.adaptUploadWorkers()
-	}
-	time.AfterFunc(td.manager.captureTime, td.closeFunc)
-	for i := 0; i < mainN; i++ {
-		wg.Add(1)
-		workerID := i
-		go td.runWorker(&wg, workerID, td.fns[mainRequestHandlerIndex])
-	}
-	for j := 0; j < auxN; {
-		for i := range td.fns {
-			if j == auxN {
-				break
-			}
-			if i == mainRequestHandlerIndex {
-				continue
-			}
-			wg.Add(1)
-			t := i
-			workerID := mainN + j
-			go td.runWorker(&wg, workerID, td.fns[t])
-			j++
-		}
-	}
-	wg.Wait()
+	td.StartContext(context.Background(), cancel, mainRequestHandlerIndex)
 }
 
-func (td *TestDirection) runWorker(wg *sync.WaitGroup, workerID int, fn func()) {
-	defer wg.Done()
-	for {
-		td.manager.runningRW.RLock()
-		running := td.manager.running
-		td.manager.runningRW.RUnlock()
-		if !running {
-			return
+// StartContext runs a phase and waits for its workers and sampler to stop.
+// Handlers must return when cancel is called.
+func (td *TestDirection) StartContext(ctx context.Context, cancel context.CancelFunc, mainRequestHandlerIndex int) {
+	dm := td.manager
+	dm.lifecycle.Lock()
+	defer dm.lifecycle.Unlock()
+
+	dm.Lock()
+	workerLimit, uploadMaxWorkers := dm.workerLimit(td.TestType == typeUpload), dm.uploadMaxWorkers
+	captureTime, frequency := dm.captureTime, dm.rateCaptureFrequency
+	dm.Unlock()
+	td.mu.Lock()
+	fns := append([]func(){}, td.fns...)
+	td.resetMeasurements()
+	td.mu.Unlock()
+	if len(fns) == 0 {
+		panic("empty task stack")
+	}
+	if mainRequestHandlerIndex < 0 || mainRequestHandlerIndex >= len(fns) {
+		mainRequestHandlerIndex = 0
+	}
+	mainN := int(0.1 * float64(len(fns)))
+	if mainN < 1 {
+		mainN = 1
+	}
+	if len(fns) == 1 || mainN > workerLimit {
+		mainN = workerLimit
+	}
+	atomic.StoreInt32(&td.maxWorkers, int32(workerLimit))
+	initialWorkers := workerLimit
+	if td.TestType == typeUpload && uploadMaxWorkers <= 8 && initialWorkers > runtime.NumCPU() {
+		initialWorkers = runtime.NumCPU()
+	}
+	atomic.StoreInt32(&td.activeWorkers, int32(initialWorkers))
+
+	runCtx, stopRun := context.WithCancel(ctx)
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			dm.runningRW.Lock()
+			dm.running = false
+			dm.runningRW.Unlock()
+			stopRun()
+			if cancel != nil {
+				cancel()
+			}
+		})
+	}
+	defer stop()
+	if ctx.Err() != nil {
+		return
+	}
+	dm.runningRW.Lock()
+	dm.running = true
+	dm.runningRW.Unlock()
+	td.mu.Lock()
+	td.closeFunc = stop
+	td.mu.Unlock()
+
+	timer := time.NewTimer(captureTime)
+	defer timer.Stop()
+	stable := make(chan struct{}, 1)
+	var wg sync.WaitGroup
+	wg.Go(func() { td.rateCapture(runCtx, frequency, stable) })
+	if td.TestType == typeUpload && workerLimit > 1 {
+		wg.Go(func() { td.adaptUploadWorkers(runCtx) })
+	}
+	aux := make([]func(), 0, len(fns)-1)
+	for i, fn := range fns {
+		if i != mainRequestHandlerIndex {
+			aux = append(aux, fn)
 		}
+	}
+	for workerID := 0; workerID < workerLimit; workerID++ {
+		fn := fns[mainRequestHandlerIndex]
+		if workerID >= mainN {
+			fn = aux[(workerID-mainN)%len(aux)]
+		}
+		wg.Go(func() { td.runWorker(runCtx, workerID, fn) })
+	}
+	select {
+	case <-runCtx.Done():
+	case <-timer.C:
+	case <-stable:
+	}
+	stop()
+	wg.Wait()
+	td.mu.Lock()
+	td.closeFunc = nil
+	td.mu.Unlock()
+}
+
+func (td *TestDirection) runWorker(ctx context.Context, workerID int, fn func()) {
+	for ctx.Err() == nil {
 		if !td.workerEnabled(workerID) {
-			time.Sleep(time.Millisecond)
+			timer := time.NewTimer(time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
 			continue
 		}
 		fn()
@@ -303,18 +343,18 @@ func (td *TestDirection) workerEnabled(workerID int) bool {
 	return int32(workerID) < atomic.LoadInt32(&td.activeWorkers)
 }
 
-func (td *TestDirection) adaptUploadWorkers() {
+func (td *TestDirection) adaptUploadWorkers(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	previousConfirmed := td.GetTotalDataVolume()
 	previousAt := time.Now()
 	bestRate := 0.0
-	for range ticker.C {
-		td.manager.runningRW.RLock()
-		running := td.manager.running
-		td.manager.runningRW.RUnlock()
-		if !running {
+	maxWorkers := atomic.LoadInt32(&td.maxWorkers)
+	for {
+		select {
+		case <-ctx.Done():
 			return
+		case <-ticker.C:
 		}
 
 		now := time.Now()
@@ -334,10 +374,10 @@ func (td *TestDirection) adaptUploadWorkers() {
 		confirmation := td.manager.GetUploadConfirmationRatio()
 		if bestRate == 0 || rate > bestRate*1.05 {
 			bestRate = rate
-			if active < td.maxWorkers {
+			if active < maxWorkers {
 				active++
 				atomic.StoreInt32(&td.activeWorkers, active)
-				dbg.Printf("Upload workers: %d/%d (confirmed: %.2f MB/s, confirmation: %.1f%%, backlog: %.2f MB)\n", active, td.maxWorkers, rate/1000/1000, confirmation*100, float64(backlog)/1000/1000)
+				dbg.Printf("Upload workers: %d/%d (confirmed: %.2f MB/s, confirmation: %.1f%%, backlog: %.2f MB)\n", active, maxWorkers, rate/1000/1000, confirmation*100, float64(backlog)/1000/1000)
 			}
 			continue
 		}
@@ -345,7 +385,7 @@ func (td *TestDirection) adaptUploadWorkers() {
 		if active > 1 && (rate < bestRate*0.85 || backlog > int64(active)*2*1024*1024) {
 			active = reducedUploadWorkerCount(active, rate, bestRate, backlog)
 			atomic.StoreInt32(&td.activeWorkers, active)
-			dbg.Printf("Upload workers: %d/%d (confirmed: %.2f MB/s, confirmation: %.1f%%, backlog: %.2f MB)\n", active, td.maxWorkers, rate/1000/1000, confirmation*100, float64(backlog)/1000/1000)
+			dbg.Printf("Upload workers: %d/%d (confirmed: %.2f MB/s, confirmation: %.1f%%, backlog: %.2f MB)\n", active, maxWorkers, rate/1000/1000, confirmation*100, float64(backlog)/1000/1000)
 			bestRate = rate
 		}
 	}
@@ -378,46 +418,65 @@ func reducedUploadWorkerCount(active int32, rate, bestRate float64, backlog int6
 	return target
 }
 
-func (td *TestDirection) rateCapture() chan bool {
-	ticker := time.NewTicker(td.manager.rateCaptureFrequency)
-	var prevTotalDataVolume int64 = 0
-	stopCapture := make(chan bool)
-	td.welford = internal.NewWelford(5*time.Second, td.manager.rateCaptureFrequency)
-	sTime := time.Now()
-	go func(t *time.Ticker) {
-		defer t.Stop()
-		for {
+func (td *TestDirection) rateCapture(ctx context.Context, frequency time.Duration, stable chan<- struct{}) {
+	ticker := time.NewTicker(frequency)
+	defer ticker.Stop()
+	welfordFrequency := min(frequency, time.Second)
+	welford := internal.NewWelford(5*time.Second, welfordFrequency)
+	scale := float64(time.Second / welfordFrequency)
+	started := time.Now()
+	previousAt := started
+	var previousTotal int64
+	sampled := false
+	sample := func() bool {
+		now := time.Now()
+		total := td.GetTotalDataVolume()
+		delta := total - previousTotal
+		elapsed := now.Sub(previousAt).Seconds()
+		rate := 0.0
+		if elapsed > 0 {
+			rate = float64(delta) / elapsed
+		}
+		globalAvg := 0.0
+		if since := now.Sub(started).Seconds(); since > 0 {
+			globalAvg = float64(total) / since
+		}
+		previousTotal, previousAt = total, now
+		if td.TestType == typeUpload {
+			// Completed upload requests confirm bytes in batches.
+			rate = globalAvg
+		}
+		td.mu.Lock()
+		if delta != 0 {
+			td.RateSequence = append(td.RateSequence, delta)
+		}
+		isStable := welford.Update(globalAvg, rate/scale)
+		td.welford = welford
+		capturedRate := ByteRate(welford.EWMA())
+		callback := td.captureCallback
+		td.mu.Unlock()
+		if callback != nil {
+			callback(capturedRate)
+		}
+		return isStable
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			if !sampled {
+				sample()
+			}
+			return
+		case <-ticker.C:
+		}
+		sampled = true
+		if sample() {
 			select {
-			case <-t.C:
-				newTotalDataVolume := td.GetTotalDataVolume()
-				deltaDataVolume := newTotalDataVolume - prevTotalDataVolume
-				prevTotalDataVolume = newTotalDataVolume
-				if deltaDataVolume != 0 {
-					td.RateSequence = append(td.RateSequence, deltaDataVolume)
-				}
-				// anyway we update the measuring instrument
-				globalAvg := (float64(td.GetTotalDataVolume())) / float64(time.Since(sTime).Milliseconds()) * 1000
-				rateSample := float64(deltaDataVolume)
-				if td.TestType == typeUpload {
-					// Upload bytes are confirmed per completed request, so use the
-					// cumulative rate to avoid reporting a zero/spike sawtooth.
-					rateSample = globalAvg * td.manager.rateCaptureFrequency.Seconds()
-				}
-				if td.welford.Update(globalAvg, rateSample) {
-					go td.closeFunc()
-				}
-				// reports the current rate at the given rate
-				if td.captureCallback != nil {
-					td.captureCallback(ByteRate(td.welford.EWMA()))
-				}
-			case stop := <-stopCapture:
-				if stop {
-					return
-				}
+			case stable <- struct{}{}:
+			default:
 			}
 		}
-	}(ticker)
-	return stopCapture
+	}
 }
 
 func (dm *DataManager) NewChunk() Chunk {
@@ -475,16 +534,22 @@ func (dm *DataManager) GetUploadConfirmationRatio() float64 {
 }
 
 func (dm *DataManager) SetRateCaptureFrequency(duration time.Duration) Manager {
+	dm.Lock()
 	dm.rateCaptureFrequency = duration
+	dm.Unlock()
 	return dm
 }
 
 func (dm *DataManager) SetCaptureTime(duration time.Duration) Manager {
+	dm.Lock()
 	dm.captureTime = duration
+	dm.Unlock()
 	return dm
 }
 
 func (dm *DataManager) SetNThread(n int) Manager {
+	dm.Lock()
+	defer dm.Unlock()
 	if n < 1 {
 		dm.nThread = runtime.NumCPU()
 		dm.uploadMaxWorkers = 8
@@ -495,39 +560,69 @@ func (dm *DataManager) SetNThread(n int) Manager {
 	return dm
 }
 
+// WorkerLimit reports how many handlers a phase schedules concurrently.
+func (dm *DataManager) WorkerLimit(upload bool) int {
+	dm.Lock()
+	defer dm.Unlock()
+	return dm.workerLimit(upload)
+}
+
+// workerLimit requires dm's lock to be held.
+func (dm *DataManager) workerLimit(upload bool) int {
+	if upload && dm.uploadMaxWorkers < dm.nThread {
+		return dm.uploadMaxWorkers
+	}
+	return dm.nThread
+}
+
 func (dm *DataManager) Snapshots() *Snapshots {
 	return dm.SnapshotStore
 }
 
 func (dm *DataManager) Reset() {
+	dm.lifecycle.Lock()
+	defer dm.lifecycle.Unlock()
+	dm.Lock()
 	dm.SnapshotStore.push(dm.Snapshot)
 	dm.Snapshot = &Snapshot{}
-	dm.download = dm.NewDataDirection(typeDownload)
-	dm.upload = dm.NewDataDirection(typeUpload)
+	dm.Unlock()
+	dm.download.prepare()
+	dm.upload.prepare()
+}
+
+func (dm *DataManager) averageRate(total int64) float64 {
+	dm.Lock()
+	duration := dm.captureTime
+	dm.Unlock()
+	if duration <= 0 {
+		return 0
+	}
+	return float64(total) * 8 / 1e6 / duration.Seconds()
 }
 
 func (dm *DataManager) GetAvgDownloadRate() float64 {
-	unit := float64(dm.captureTime / time.Millisecond)
-	return float64(dm.download.GetTotalDataVolume()*8/1000) / unit
+	return dm.averageRate(dm.GetTotalDownload())
+}
+
+func (td *TestDirection) ewmaRate() float64 {
+	td.mu.RLock()
+	defer td.mu.RUnlock()
+	if td.welford != nil {
+		return td.welford.EWMA()
+	}
+	return 0
 }
 
 func (dm *DataManager) GetEWMADownloadRate() float64 {
-	if dm.download.welford != nil {
-		return dm.download.welford.EWMA()
-	}
-	return 0
+	return dm.download.ewmaRate()
 }
 
 func (dm *DataManager) GetAvgUploadRate() float64 {
-	unit := float64(dm.captureTime / time.Millisecond)
-	return float64(dm.upload.GetTotalDataVolume()*8/1000) / unit
+	return dm.averageRate(dm.GetTotalUpload())
 }
 
 func (dm *DataManager) GetEWMAUploadRate() float64 {
-	if dm.upload.welford != nil {
-		return dm.upload.welford.EWMA()
-	}
-	return 0
+	return dm.upload.ewmaRate()
 }
 
 type DataChunk struct {
@@ -698,6 +793,9 @@ func sampleVariance(vector []int64) (mean, variance, stdDev, min, max int64) {
 		}
 	}
 	mean = sumNum / int64(len(vector))
+	if len(vector) == 1 {
+		return
+	}
 	for _, value := range vector {
 		accumulate += (value - mean) * (value - mean)
 	}
@@ -711,6 +809,7 @@ const maxSnapshotSize = 10
 type Snapshot []*DataChunk
 
 type Snapshots struct {
+	mu      sync.RWMutex
 	sp      []*Snapshot
 	maxSize int
 }
@@ -723,6 +822,8 @@ func newHistorySnapshots(size int) *Snapshots {
 }
 
 func (rs *Snapshots) push(value *Snapshot) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
 	if len(rs.sp) == rs.maxSize {
 		rs.sp = rs.sp[1:]
 	}
@@ -730,6 +831,8 @@ func (rs *Snapshots) push(value *Snapshot) {
 }
 
 func (rs *Snapshots) Latest() *Snapshot {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
 	if len(rs.sp) > 0 {
 		return rs.sp[len(rs.sp)-1]
 	}
@@ -737,9 +840,13 @@ func (rs *Snapshots) Latest() *Snapshot {
 }
 
 func (rs *Snapshots) All() []*Snapshot {
-	return rs.sp
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	return append([]*Snapshot{}, rs.sp...)
 }
 
 func (rs *Snapshots) Clean() {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
 	rs.sp = make([]*Snapshot, 0, rs.maxSize)
 }

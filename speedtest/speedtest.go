@@ -8,8 +8,11 @@ import (
 	"net/url"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"github.com/XiaoMengXinX/globalspeedtest-go/speedtest/caict"
 )
 
 var (
@@ -42,9 +45,21 @@ type Speedtest struct {
 	tcpDialer *net.Dialer
 	udpDialer *net.Dialer
 	ipDialer  *net.Dialer
+
+	userAgentOverride bool
+
+	userMu     sync.Mutex
+	userLookup *userLookup
+	registry   *registryLookup
 }
 
 type UserConfig struct {
+	ControlURL string
+	DeviceID   string
+	Bandwidth  int
+	Province   string
+	Operator   string
+
 	T             *http.Transport
 	UserAgent     string
 	Proxy         string
@@ -74,6 +89,23 @@ func parseAddr(addr string) (string, string) {
 }
 
 func (s *Speedtest) NewUserConfig(uc *UserConfig) {
+	if uc == nil {
+		uc = &UserConfig{}
+	}
+	if uc.ControlURL == "" {
+		uc.ControlURL = caict.DefaultControlBase
+	}
+	if uc.DeviceID == "" {
+		uc.DeviceID = caict.NewDeviceID()
+	}
+	if uc.Bandwidth <= 0 {
+		uc.Bandwidth = 500
+	}
+	s.userMu.Lock()
+	s.userLookup = nil
+	s.registry = nil
+	s.User = nil
+	s.userMu.Unlock()
 	if uc.Debug {
 		dbg.Enable()
 	}
@@ -103,6 +135,7 @@ func (s *Speedtest) NewUserConfig(uc *UserConfig) {
 	var icmpSource net.Addr
 	var proxy = http.ProxyFromEnvironment
 	s.config = uc
+	s.userAgentOverride = uc.UserAgent != ""
 	if len(s.config.UserAgent) == 0 {
 		s.config.UserAgent = DefaultUserAgent
 	}
@@ -183,21 +216,43 @@ func (s *Speedtest) NewUserConfig(uc *UserConfig) {
 		Control:   uc.DialerControl,
 	}
 
-	s.config.T = &http.Transport{
-		Proxy:                 proxy,
-		DialContext:           s.tcpDialer.DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
+	if uc.T == nil {
+		s.config.T = &http.Transport{
+			Proxy:                 proxy,
+			DialContext:           s.tcpDialer.DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: time.Second,
+		}
+	} else {
+		s.config.T = uc.T.Clone()
+		if uc.Source != "" || uc.DialerControl != nil {
+			s.config.T.DialContext = s.tcpDialer.DialContext
+		}
+		if uc.Proxy != "" {
+			s.config.T.Proxy = proxy
+		}
 	}
-
+	s.config.T.DisableCompression = true
+	if s.doer == nil {
+		s.doer = &http.Client{}
+	}
 	s.doer.Transport = s
 }
 
+// RoundTrip applies a configured User-Agent override, otherwise keeps each
+// request's protocol-specific header and only supplies the default when none
+// is set.
 func (s *Speedtest) RoundTrip(req *http.Request) (*http.Response, error) {
-	req.Header.Add("User-Agent", s.config.UserAgent)
+	if s.userAgentOverride || req.Header.Get("User-Agent") == "" {
+		req = req.Clone(req.Context())
+		if req.Header == nil {
+			req.Header = make(http.Header)
+		}
+		req.Header.Set("User-Agent", s.config.UserAgent)
+	}
 	return s.config.T.RoundTrip(req)
 }
 
@@ -230,11 +285,11 @@ func WithUserConfig(userConfig *UserConfig) Option {
 // New creates a new speedtest client.
 func New(opts ...Option) *Speedtest {
 	s := &Speedtest{
-		doer:    http.DefaultClient,
+		doer:    &http.Client{},
 		Manager: NewDataManager(),
 	}
 	// load default config
-	s.NewUserConfig(&UserConfig{UserAgent: DefaultUserAgent})
+	s.NewUserConfig(&UserConfig{})
 
 	for _, opt := range opts {
 		opt(s)

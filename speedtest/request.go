@@ -1,20 +1,25 @@
 package speedtest
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+	"mime/multipart"
 	"net"
 	"net/http"
+	"net/textproto"
 	"net/url"
-	"path"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/showwin/speedtest-go/speedtest/transport"
+	"github.com/XiaoMengXinX/globalspeedtest-go/speedtest/caict"
 )
 
 type (
@@ -22,573 +27,615 @@ type (
 	uploadFunc   func(context.Context, *Server, int) error
 )
 
-var (
-	dlSizes = [...]int{350, 500, 750, 1000, 1500, 2000, 2500, 3000, 3500, 4000}
-	ulSizes = [...]int{100, 300, 500, 800, 1000, 1500, 2500, 3000, 3500, 4000} // kB
+var ulSizes = [...]int{100, 300, 500, 800, 1000, 1500, 2500, 3000, 3500, 4000}
+
+var ErrConnectTimeout = errors.New("server connect timeout")
+
+const (
+	nodeControlUA  = "Mozilla/5.0 (Windows NT 6.1; Trident/7.0; rv:11.0) like Gecko"
+	nodeDownloadUA = "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.60 Safari/537.36"
+	nodeUploadUA   = "Dalvik/1.6.0 (Linux; U; Android 4.2.2; GT-I9505 Build/JDQ39)"
+	uploadBoundary = "00content0boundary00"
 )
 
-var (
-	ErrConnectTimeout = errors.New("server connect timeout")
-)
+type nodeSession struct {
+	key       string
+	timestamp string
+}
 
-func (s *Server) MultiDownloadTestContext(ctx context.Context, servers Servers) error {
-	ss := servers.Available()
-	if ss.Len() == 0 {
-		return errors.New("not found available servers")
+type nodeSessionContextKey struct{}
+
+var nodeSessionPattern = regexp.MustCompile(`^1-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$`)
+
+type queryParam struct{ key, value string }
+
+func (s *Server) nodeURL(path string, params []queryParam) (string, error) {
+	u, err := url.Parse(s.URL)
+	if err != nil {
+		return "", err
 	}
-	mainIDIndex := 0
-	var td *TestDirection
-	_context, cancel := context.WithCancel(ctx)
-	defer cancel()
-	var errorTimes int64 = 0
-	var requestTimes int64 = 0
-	for i, server := range *ss {
-		if server.ID == s.ID {
-			mainIDIndex = i
+	if u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return "", errors.New("invalid node URL")
+	}
+	var raw strings.Builder
+	for i, p := range params {
+		if i > 0 {
+			raw.WriteByte('&')
 		}
-		sp := server
-		dbg.Printf("Register Download Handler: %s\n", sp.URL)
-		td = server.Context.RegisterDownloadHandler(func() {
-			atomic.AddInt64(&requestTimes, 1)
-			if err := sp.downloadRequest()(_context, sp, 3); err != nil {
-				atomic.AddInt64(&errorTimes, 1)
-			}
-		})
+		raw.WriteString(url.QueryEscape(p.key))
+		raw.WriteByte('=')
+		raw.WriteString(url.QueryEscape(p.value))
 	}
-	if td == nil {
-		return ErrorUninitializedManager
+	u.Path, u.RawPath, u.RawQuery, u.Fragment = path, path, raw.String(), ""
+	return u.String(), nil
+}
+
+func nodeRequestError(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return urlErr.Err
 	}
-	td.Start(cancel, mainIDIndex) // block here
-	s.DLSpeed = ByteRate(td.manager.GetEWMADownloadRate())
-	if s.DLSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
-		s.DLSpeed = -1 // N/A
+	return err
+}
+
+func (s *Server) issueSession(ctx context.Context) (nodeSession, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	stamp := strconv.FormatInt(time.Now().Unix(), 10)
+	config := s.Context.config
+	query := []queryParam{
+		{"key", ""}, {"flag", "true"}, {"bandwidth", strconv.Itoa(config.Bandwidth)},
+		{"model", "iphone"}, {"imei", config.DeviceID}, {"time", stamp},
+		{"token", caict.ComputeToken("iphone", config.DeviceID, stamp, config.Bandwidth)},
+		{"pkg", caict.DefaultPkg},
+	}
+	rawURL, err := s.nodeURL("/speed/dovalid", query)
+	if err != nil {
+		return nodeSession{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nodeSession{}, err
+	}
+	req.Header.Set("User-Agent", nodeControlUA)
+	resp, err := s.Context.doer.Do(req)
+	if err != nil {
+		return nodeSession{}, nodeRequestError(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nodeSession{}, fmt.Errorf("session request: HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4097))
+	if err != nil {
+		return nodeSession{}, err
+	}
+	answer := strings.TrimSpace(string(body))
+	match := nodeSessionPattern.FindStringSubmatch(answer)
+	if len(body) <= 4096 && match != nil {
+		return nodeSession{key: match[1], timestamp: stamp}, nil
+	}
+	cause := caict.ErrInvalidResponse
+	switch answer {
+	case "0", "0-":
+		cause = caict.ErrBusy
+	case "2", "2-":
+		cause = caict.ErrRetry
+	case "-1", "-1-":
+		cause = caict.ErrRejected
+	}
+	return nodeSession{}, &caict.DovalidError{Response: answer, Err: cause}
+}
+
+func (s *Server) releaseSession(session nodeSession) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	rawURL, err := s.nodeURL("/speed/dovalid", []queryParam{{"key", session.key}})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", nodeControlUA)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := s.Context.doer.Do(req)
+	if err != nil {
+		return nodeRequestError(err)
+	}
+	defer resp.Body.Close()
+	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)); err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("release session: HTTP %d", resp.StatusCode)
 	}
 	return nil
+}
+
+func (s *Server) MultiDownloadTestContext(ctx context.Context, servers Servers) error {
+	return s.measureContext(ctx, servers, false, downloadRequest)
 }
 
 func (s *Server) MultiUploadTestContext(ctx context.Context, servers Servers) error {
-	ss := servers.Available()
-	if ss.Len() == 0 {
-		return errors.New("not found available servers")
-	}
-	mainIDIndex := 0
-	var td *TestDirection
-	_context, cancel := context.WithCancel(ctx)
-	defer cancel()
-	var errorTimes int64 = 0
-	var requestTimes int64 = 0
-	for i, server := range *ss {
-		if server.ID == s.ID {
-			mainIDIndex = i
-		}
-		server.resolveUploadURL(ctx)
-		sp := server
-		dbg.Printf("Register Upload Handler: %s\n", sp.URL)
-		td = server.Context.RegisterUploadHandler(func() {
-			atomic.AddInt64(&requestTimes, 1)
-			if err := sp.uploadRequest()(_context, sp, 3); err != nil {
-				atomic.AddInt64(&errorTimes, 1)
-			}
-		})
-	}
-	if td == nil {
-		return ErrorUninitializedManager
-	}
-	td.Start(cancel, mainIDIndex) // block here
-	s.ULSpeed = ByteRate(td.manager.GetEWMAUploadRate())
-	if s.ULSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
-		s.ULSpeed = -1 // N/A
-	}
-	return nil
+	return s.measureContext(ctx, servers, true, uploadRequest)
 }
 
-// DownloadTest executes the test to measure download speed
+// DownloadTest measures download speed.
 func (s *Server) DownloadTest() error {
-	return s.downloadTestContext(context.Background(), s.downloadRequest())
+	return s.DownloadTestContext(context.Background())
 }
 
-// DownloadTestContext executes the test to measure download speed, observing the given context.
+// DownloadTestContext measures download speed until the capture window ends or ctx is canceled.
 func (s *Server) DownloadTestContext(ctx context.Context) error {
 	return s.downloadTestContext(ctx, s.downloadRequest())
 }
 
-func (s *Server) downloadTestContext(ctx context.Context, downloadRequest downloadFunc) error {
-	var errorTimes int64 = 0
-	var requestTimes int64 = 0
-	start := time.Now()
-	_context, cancel := context.WithCancel(ctx)
-	s.Context.RegisterDownloadHandler(func() {
-		atomic.AddInt64(&requestTimes, 1)
-		if err := downloadRequest(_context, s, 3); err != nil {
-			atomic.AddInt64(&errorTimes, 1)
-		}
-	}).Start(cancel, 0)
-	duration := time.Since(start)
-	s.DLSpeed = ByteRate(s.Context.GetEWMADownloadRate())
-	if s.DLSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
-		s.DLSpeed = -1 // N/A
-	}
-	s.TestDuration.Download = &duration
-	s.testDurationTotalCount()
-	return nil
+func (s *Server) downloadTestContext(ctx context.Context, request downloadFunc) error {
+	return s.measureContext(ctx, Servers{s}, false, request)
 }
 
-// UploadTest executes the test to measure upload speed
+// UploadTest measures upload speed.
 func (s *Server) UploadTest() error {
 	return s.UploadTestContext(context.Background())
 }
 
-// UploadTestContext executes the test to measure upload speed, observing the given context.
+// UploadTestContext measures confirmed upload speed.
 func (s *Server) UploadTestContext(ctx context.Context) error {
-	s.resolveUploadURL(ctx)
 	return s.uploadTestContext(ctx, s.uploadRequest())
 }
 
-func (s *Server) resolveUploadURL(ctx context.Context) {
-	if s.Context.config.TestMode == TCPTest {
-		return
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, s.URL, nil)
-	if err != nil {
-		return
-	}
-	resp, err := s.Context.doer.Do(req)
-	if err != nil {
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.Request == nil || resp.Request.URL == nil {
-		return
-	}
-	resolvedURL := resp.Request.URL.String()
-	if resolvedURL != s.URL {
-		dbg.Printf("Resolved upload URL: %s -> %s\n", s.URL, resolvedURL)
-		s.URL = resolvedURL
-	}
+func (s *Server) downloadRequest() downloadFunc { return downloadRequest }
+func (s *Server) uploadRequest() uploadFunc     { return uploadRequest }
+
+func (s *Server) uploadTestContext(ctx context.Context, request uploadFunc) error {
+	return s.measureContext(ctx, Servers{s}, true, request)
 }
 
-func (s *Server) downloadRequest() downloadFunc {
-	if s.Context.config.TestMode == TCPTest {
-		return tcpDownloadRequest
+func (s *Server) measureContext(ctx context.Context, servers Servers, upload bool, request func(context.Context, *Server, int) error) (result error) {
+	if s.Context == nil || s.Context.Manager == nil {
+		return ErrorUninitializedManager
 	}
-	return downloadRequest
-}
-
-func (s *Server) uploadRequest() uploadFunc {
-	if s.Context.config.TestMode == TCPTest {
-		return tcpUploadRequest
+	manager := s.Context.Manager
+	if upload {
+		manager.PrepareUpload()
+		s.ULSpeed = 0
+	} else {
+		manager.PrepareDownload()
+		s.DLSpeed = 0
 	}
-	return uploadRequest
-}
-
-func (s *Server) uploadTestContext(ctx context.Context, uploadRequest uploadFunc) error {
-	var errorTimes int64 = 0
-	var requestTimes int64 = 0
 	start := time.Now()
-	_context, cancel := context.WithCancel(ctx)
-	s.Context.RegisterUploadHandler(func() {
-		atomic.AddInt64(&requestTimes, 1)
-		if err := uploadRequest(_context, s, 4); err != nil {
-			atomic.AddInt64(&errorTimes, 1)
+	defer func() {
+		duration := time.Since(start)
+		if upload {
+			s.ULSpeed = ByteRate(manager.GetEWMAUploadRate())
+			s.TestDuration.Upload = &duration
+			if result != nil && manager.GetTotalUpload() == 0 {
+				s.ULSpeed = -1
+			}
+		} else {
+			s.DLSpeed = ByteRate(manager.GetEWMADownloadRate())
+			s.TestDuration.Download = &duration
+			if result != nil && manager.GetTotalDownload() == 0 {
+				s.DLSpeed = -1
+			}
 		}
-	}).Start(cancel, 0)
-	duration := time.Since(start)
-	s.ULSpeed = ByteRate(s.Context.GetEWMAUploadRate())
-	if s.ULSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
-		s.ULSpeed = -1 // N/A
+		s.testDurationTotalCount()
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	s.TestDuration.Upload = &duration
-	s.testDurationTotalCount()
-	return nil
+	available := servers.Available()
+	if available.Len() == 0 {
+		return errors.New("not found available servers")
+	}
+	participants := append(Servers{}, *available...)
+	for i, server := range participants {
+		if server == s || (s.ID != "" && server.ID == s.ID) {
+			participants[0], participants[i] = participants[i], participants[0]
+			break
+		}
+	}
+	if limit := manager.WorkerLimit(upload); len(participants) > limit {
+		participants = participants[:limit]
+	}
+	phaseCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var td *TestDirection
+	var workerErr error
+	var firstError sync.Once
+	for _, server := range participants {
+		if server.Context == nil {
+			return ErrorUninitializedManager
+		}
+		session, err := server.issueSession(phaseCtx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
+		}
+		defer func() { result = errors.Join(result, server.releaseSession(session)) }()
+		workerContext := Speedtest{
+			Manager:   manager,
+			doer:      server.Context.doer,
+			config:    server.Context.config,
+			tcpDialer: server.Context.tcpDialer,
+			udpDialer: server.Context.udpDialer,
+			ipDialer:  server.Context.ipDialer,
+		}
+		workerServer := *server
+		workerServer.Context = &workerContext
+		requestCtx := context.WithValue(phaseCtx, nodeSessionContextKey{}, session)
+		worker := func() {
+			if phaseCtx.Err() != nil {
+				return
+			}
+			if err := request(requestCtx, &workerServer, 4); err != nil && phaseCtx.Err() == nil {
+				firstError.Do(func() { workerErr = err; cancel() })
+			}
+		}
+		if upload {
+			td = manager.RegisterUploadHandler(worker)
+		} else {
+			td = manager.RegisterDownloadHandler(worker)
+		}
+	}
+	if td == nil {
+		return ErrorUninitializedManager
+	}
+	td.StartContext(phaseCtx, cancel, 0)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return workerErr
 }
 
-func downloadRequest(ctx context.Context, s *Server, w int) error {
-	size := dlSizes[w]
-	u, err := url.Parse(s.URL)
+func downloadRequest(ctx context.Context, s *Server, _ int) error {
+	session, ok := ctx.Value(nodeSessionContextKey{}).(nodeSession)
+	if !ok {
+		return errors.New("download session is missing")
+	}
+	rawURL, err := s.nodeURL("/speed/File(1G).dl", []queryParam{
+		{"r", session.timestamp}, {"key", session.key},
+	})
 	if err != nil {
 		return err
 	}
-	u.Path = path.Dir(u.Path)
-	xdlURL := u.JoinPath(fmt.Sprintf("random%dx%d.jpg", size, size)).String()
-	dbg.Printf("XdlURL: %s\n", xdlURL)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, xdlURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return err
 	}
-
+	req.Header.Set("User-Agent", nodeDownloadUA)
+	req.Header.Set("Accept", "*/*")
+	req.Close = true
 	resp, err := s.Context.doer.Do(req)
 	if err != nil {
-		return err
+		return nodeRequestError(err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("download request failed: %s", resp.Status)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return fmt.Errorf("download request: HTTP %d", resp.StatusCode)
 	}
 	return s.Context.NewChunk().DownloadHandler(resp.Body)
 }
 
+type uploadBody struct {
+	io.Reader
+	read atomic.Int64
+}
+
+func (b *uploadBody) Read(p []byte) (int, error) {
+	n, err := b.Reader.Read(p)
+	b.read.Add(int64(n))
+	return n, err
+}
+
 func uploadRequest(ctx context.Context, s *Server, w int) error {
-	size := ulSizes[w]
-	chunkSize := int64(size*100-51) * 10
-	dc := s.Context.NewChunk().UploadHandler(chunkSize)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.URL, io.NopCloser(dc))
+	session, ok := ctx.Value(nodeSessionContextKey{}).(nodeSession)
+	if !ok {
+		return errors.New("upload session is missing")
+	}
+	if w < 0 || w >= len(ulSizes) {
+		return errors.New("invalid upload size")
+	}
+	size := int64(ulSizes[w]*100-51) * 10
+	var framing bytes.Buffer
+	form := multipart.NewWriter(&framing)
+	if err := form.SetBoundary(uploadBoundary); err != nil {
+		return err
+	}
+	header := textproto.MIMEHeader{}
+	header.Set("Content-Disposition", fmt.Sprintf(`form-data; name="upload"; filename="SPEED_%d"`, time.Now().UnixNano()))
+	header.Set("Content-Type", "application/octet-stream")
+	if _, err := form.CreatePart(header); err != nil {
+		return err
+	}
+	prefixLength := framing.Len()
+	if err := form.Close(); err != nil {
+		return err
+	}
+	body := &uploadBody{Reader: io.MultiReader(bytes.NewReader(framing.Bytes()[:prefixLength]), s.Context.NewChunk().UploadHandler(size), bytes.NewReader(framing.Bytes()[prefixLength:]))}
+	rawURL, err := s.nodeURL("/speed/doAnalsLoad.do", nil)
 	if err != nil {
 		return err
 	}
-	req.ContentLength = chunkSize
-	dbg.Printf("Len=%d, XulURL: %s\n", req.ContentLength, s.URL)
-	req.Header.Set("Content-Type", "application/octet-stream")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, io.NopCloser(body))
+	if err != nil {
+		return err
+	}
+	req.ContentLength = size + int64(framing.Len())
+	req.Header.Set("Content-Type", form.FormDataContentType())
+	req.Header.Set("Key", session.key)
+	req.Header.Set("User-Agent", nodeUploadUA)
+	req.Header.Set("Accept", "*/*")
+	req.Close = true
 	resp, err := s.Context.doer.Do(req)
 	if err != nil {
-		return err
+		return nodeRequestError(err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("upload request: HTTP %d", resp.StatusCode)
+	}
 	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 		return err
 	}
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("upload request failed: %s", resp.Status)
+	if body.read.Load() != req.ContentLength {
+		return io.ErrUnexpectedEOF
 	}
-	// Treat a successful upload.php response as application-level upload confirmation.
-	s.Context.AddTotalUpload(chunkSize)
+	s.Context.AddTotalUpload(size)
 	return nil
 }
 
+// TCPTest uses the node's HTTP service for throughput.
+func tcpDownloadRequest(ctx context.Context, s *Server, w int) error {
+	return downloadRequest(ctx, s, w)
+}
+func tcpUploadRequest(ctx context.Context, s *Server, w int) error { return uploadRequest(ctx, s, w) }
+
 func tcpHost(s *Server) (string, error) {
+	u, err := url.Parse(s.URL)
+	if err != nil {
+		return "", err
+	}
 	host := s.Host
 	if host == "" {
-		u, err := url.Parse(s.URL)
-		if err != nil {
-			return "", err
-		}
-		if u.Hostname() == "" {
-			return "", errors.New("tcp server host is empty")
-		}
 		host = u.Host
+	}
+	if host == "" {
+		return "", errors.New("tcp server host is empty")
 	}
 	if _, _, err := net.SplitHostPort(host); err == nil {
 		return host, nil
 	}
-	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
-		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	port := "80"
+	if u.Scheme == "https" {
+		port = "443"
 	}
-	return net.JoinHostPort(host, "8080"), nil
+	return net.JoinHostPort(strings.Trim(host, "[]"), port), nil
 }
 
-func tcpDownloadRequest(ctx context.Context, s *Server, w int) error {
-	host, err := tcpHost(s)
-	if err != nil {
-		return err
-	}
-	client, err := transport.NewClient(s.Context.tcpDialer)
-	if err != nil {
-		return err
-	}
-	if err = client.Connect(ctx, host); err != nil {
-		return err
-	}
-	defer func() { _ = client.Disconnect() }()
-	if _, err = client.VersionContext(ctx); err != nil {
-		return err
-	}
-	size := int64(dlSizes[w]) * 1000
-	return client.Download(ctx, size, s.Context.NewChunk().DownloadHandler)
-}
-
-func tcpUploadRequest(ctx context.Context, s *Server, w int) error {
-	host, err := tcpHost(s)
-	if err != nil {
-		return err
-	}
-	client, err := transport.NewClient(s.Context.tcpDialer)
-	if err != nil {
-		return err
-	}
-	if err = client.Connect(ctx, host); err != nil {
-		return err
-	}
-	defer func() { _ = client.Disconnect() }()
-	size := int64(ulSizes[w]) * 1000
-	payloadSize, err := transport.UploadPayloadSize(size)
-	if err != nil {
-		return err
-	}
-	dc := s.Context.NewChunk().UploadHandler(payloadSize)
-	acknowledged, err := client.Upload(ctx, size, dc)
-	if err != nil {
-		return err
-	}
-	overhead := size - payloadSize
-	if acknowledged < overhead {
-		return transport.ErrInvalidResponse
-	}
-	s.Context.AddTotalUpload(acknowledged - overhead)
-	return nil
-}
-
-// PingTest executes test to measure latency
+// PingTest measures latency.
 func (s *Server) PingTest(callback func(latency time.Duration)) error {
 	return s.PingTestContext(context.Background(), callback)
 }
 
-// PingTestContext executes test to measure latency, observing the given context.
+// PingTestContext measures latency and jitter, observing ctx.
 func (s *Server) PingTestContext(ctx context.Context, callback func(latency time.Duration)) (err error) {
 	start := time.Now()
-	var vectorPingResult []int64
+	var samples []int64
+	var summary probeSummary
+	ctx = context.WithValue(ctx, probeSummaryContextKey{}, &summary)
 	switch s.Context.config.PingMode {
 	case TCP:
-		vectorPingResult, err = s.TCPPing(ctx, 10, time.Millisecond*200, callback)
+		samples, err = s.TCPPing(ctx, 10, 200*time.Millisecond, callback)
 	case ICMP:
-		vectorPingResult, err = s.ICMPPing(ctx, time.Second*4, 10, time.Millisecond*200, callback)
+		samples, err = s.ICMPPing(ctx, 4*time.Second, 10, 200*time.Millisecond, callback)
 	default:
-		vectorPingResult, err = s.HTTPPing(ctx, 10, time.Millisecond*200, callback)
+		samples, err = s.HTTPPing(ctx, 10, 200*time.Millisecond, callback)
 	}
-	if err != nil || len(vectorPingResult) == 0 {
-		return err
+	s.PacketLoss.Sent, s.PacketLoss.Dup, s.PacketLoss.Max = summary.successes, 0, summary.attempts-1
+	if len(samples) > 0 {
+		mean, _, std, min, max := StandardDeviation(samples)
+		s.Latency, s.Jitter = time.Duration(mean), time.Duration(std)
+		s.MinLatency, s.MaxLatency = time.Duration(min), time.Duration(max)
+	} else {
+		s.Latency = PingTimeout
 	}
-	dbg.Printf("Before StandardDeviation: %v\n", vectorPingResult)
-	mean, _, std, minLatency, maxLatency := StandardDeviation(vectorPingResult)
 	duration := time.Since(start)
-	s.Latency = time.Duration(mean) * time.Nanosecond
-	s.Jitter = time.Duration(std) * time.Nanosecond
-	s.MinLatency = time.Duration(minLatency) * time.Nanosecond
-	s.MaxLatency = time.Duration(maxLatency) * time.Nanosecond
 	s.TestDuration.Ping = &duration
 	s.testDurationTotalCount()
-	return nil
+	return err
 }
 
-// TestAll executes ping, download and upload tests one by one
+// TestAll measures ping, download, and upload in sequence.
 func (s *Server) TestAll() error {
-	err := s.PingTest(nil)
-	if err != nil {
+	if err := s.PingTest(nil); err != nil {
 		return err
 	}
-	err = s.DownloadTest()
-	if err != nil {
+	if err := s.DownloadTest(); err != nil {
 		return err
 	}
 	return s.UploadTest()
 }
 
-func (s *Server) TCPPing(
-	ctx context.Context,
-	echoTimes int,
-	echoFreq time.Duration,
-	callback func(latency time.Duration),
-) (latencies []int64, err error) {
-	var pingDst string
-	if len(s.Host) == 0 {
-		u, err := url.Parse(s.URL)
-		if err != nil || len(u.Host) == 0 {
-			return nil, err
-		}
-		pingDst = u.Host
-	} else {
-		pingDst = s.Host
+func waitProbe(ctx context.Context, interval time.Duration) error {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
-	failTimes := 0
-	client, err := transport.NewClient(s.Context.tcpDialer)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = client.Disconnect() }()
-	err = client.Connect(ctx, pingDst)
-	if err != nil {
-		return nil, err
-	}
-	for i := 0; i < echoTimes; i++ {
-		latency, err := client.PingContext(ctx)
-		if err != nil {
-			failTimes++
-			continue
-		}
-		latencies = append(latencies, latency)
-		if callback != nil {
-			callback(time.Duration(latency))
-		}
-		time.Sleep(echoFreq)
-	}
-	if failTimes == echoTimes {
-		return nil, ErrConnectTimeout
-	}
-	return
 }
 
-func (s *Server) HTTPPing(
-	ctx context.Context,
-	echoTimes int,
-	echoFreq time.Duration,
-	callback func(latency time.Duration),
-) (latencies []int64, err error) {
-	var contextErr error
-	u, err := url.Parse(s.URL)
-	if err != nil || len(u.Host) == 0 {
-		return nil, err
+type probeSummary struct{ attempts, successes int }
+type probeSummaryContextKey struct{}
+
+func (s *Server) probe(ctx context.Context, count int, interval time.Duration, callback func(time.Duration), request func(context.Context) error) (latencies []int64, err error) {
+	var summary probeSummary
+	defer func() {
+		if result, ok := ctx.Value(probeSummaryContextKey{}).(*probeSummary); ok {
+			*result = summary
+		}
+	}()
+	for i := 0; i < count; i++ {
+		if err := ctx.Err(); err != nil {
+			return latencies, err
+		}
+		summary.attempts++
+		start := time.Now()
+		probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		err := request(probeCtx)
+		cancel()
+		elapsed := time.Since(start)
+		if ctx.Err() != nil {
+			return latencies, ctx.Err()
+		}
+		if err == nil {
+			summary.successes++
+			latencies = append(latencies, elapsed.Nanoseconds())
+			if callback != nil {
+				callback(elapsed)
+			}
+		}
+		if i+1 < count {
+			if err := waitProbe(ctx, interval); err != nil {
+				return latencies, err
+			}
+		}
 	}
-	u.Path = path.Dir(u.Path)
-	pingDst := u.JoinPath("latency.txt").String()
-	dbg.Printf("Echo: %s\n", pingDst)
-	failTimes := 0
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pingDst, nil)
+	if len(latencies) == 0 {
+		return nil, ErrConnectTimeout
+	}
+	return latencies, nil
+}
+
+// TCPPing measures TCP handshake latency using the configured dialer.
+func (s *Server) TCPPing(ctx context.Context, echoTimes int, echoFreq time.Duration, callback func(time.Duration)) ([]int64, error) {
+	host, err := tcpHost(s)
 	if err != nil {
 		return nil, err
 	}
-	// carry out an extra request to warm up the connection and ensure the first request is not going to affect the
-	// overall estimation
-	echoTimes++
-	for i := 0; i < echoTimes; i++ {
-		sTime := time.Now()
-		resp, err := s.Context.doer.Do(req)
-		endTime := time.Since(sTime)
+	return s.probe(ctx, echoTimes, echoFreq, callback, func(ctx context.Context) error {
+		conn, err := s.Context.tcpDialer.DialContext(ctx, "tcp", host)
 		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				contextErr = err
-				break
-			}
-
-			failTimes++
-			continue
+			return err
 		}
-		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-			_ = resp.Body.Close()
-			failTimes++
-			continue
+		return conn.Close()
+	})
+}
+
+// HTTPPing accepts node-root responses below HTTP 500, including HTTP 404.
+func (s *Server) HTTPPing(ctx context.Context, echoTimes int, echoFreq time.Duration, callback func(time.Duration)) ([]int64, error) {
+	rawURL, err := s.nodeURL("/", nil)
+	if err != nil {
+		return nil, err
+	}
+	return s.probe(ctx, echoTimes, echoFreq, callback, func(ctx context.Context) error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if err != nil {
+			return err
 		}
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-		if i > 0 {
-			latency := endTime.Nanoseconds()
-			latencies = append(latencies, latency)
-			dbg.Printf("RTT: %d\n", latency)
-			if callback != nil {
-				callback(endTime)
-			}
+		resp, err := s.Context.doer.Do(req)
+		if err != nil {
+			return nodeRequestError(err)
 		}
-		time.Sleep(echoFreq)
-	}
-
-	if contextErr != nil {
-		return latencies, contextErr
-	}
-
-	if failTimes == echoTimes {
-		return nil, ErrConnectTimeout
-	}
-
-	return
+		defer resp.Body.Close()
+		if resp.StatusCode >= 500 {
+			return fmt.Errorf("ping request: HTTP %d", resp.StatusCode)
+		}
+		return nil
+	})
 }
 
 const PingTimeout = -1
-const echoOptionDataSize = 32 // `echoMessage` need to change at same time
+const echoOptionDataSize = 32
 
-// ICMPPing privileged method
-func (s *Server) ICMPPing(
-	ctx context.Context,
-	readTimeout time.Duration,
-	echoTimes int,
-	echoFreq time.Duration,
-	callback func(latency time.Duration),
-) (latencies []int64, err error) {
-	u, err := url.ParseRequestURI(s.URL)
-	if err != nil || len(u.Host) == 0 {
-		return nil, err
-	}
-	dbg.Printf("Echo: %s\n", strings.Split(u.Host, ":")[0])
-	dialContext, err := s.Context.ipDialer.DialContext(ctx, "ip:icmp", strings.Split(u.Host, ":")[0])
+// ICMPPing requires permission to open an ICMP socket.
+func (s *Server) ICMPPing(ctx context.Context, readTimeout time.Duration, echoTimes int, echoFreq time.Duration, callback func(time.Duration)) (latencies []int64, err error) {
+	u, err := url.Parse(s.URL)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = dialContext.Close() }()
-
-	ICMPData := make([]byte, 8+echoOptionDataSize) // header + data
-	ICMPData[0] = 8                                // echo
-	ICMPData[1] = 0                                // code
-	ICMPData[2] = 0                                // checksum
-	ICMPData[3] = 0                                // checksum
-	ICMPData[4] = 0                                // id
-	ICMPData[5] = 1                                // id
-	ICMPData[6] = 0                                // seq
-	ICMPData[7] = 1                                // seq
-
-	var echoMessage = "Hi! SpeedTest-Go \\(●'◡'●)/"
-
-	for i := 0; i < len(echoMessage); i++ {
-		ICMPData[7+i] = echoMessage[i]
+	if u.Hostname() == "" {
+		return nil, errors.New("icmp server host is empty")
 	}
-
-	failTimes := 0
-	for i := 0; i < echoTimes; i++ {
-		ICMPData[2] = byte(0)
-		ICMPData[3] = byte(0)
-
-		ICMPData[6] = byte(1 >> 8)
-		ICMPData[7] = byte(1)
-		ICMPData[8+echoOptionDataSize-1] = 6
-		cs := checkSum(ICMPData)
-		ICMPData[2] = byte(cs >> 8)
-		ICMPData[3] = byte(cs)
-
-		sTime := time.Now()
-		_ = dialContext.SetDeadline(sTime.Add(readTimeout))
-		_, err = dialContext.Write(ICMPData)
+	conn, err := s.Context.ipDialer.DialContext(ctx, "ip:icmp", u.Hostname())
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	packet := make([]byte, 8+echoOptionDataSize)
+	packet[0], packet[5] = 8, 1
+	copy(packet[8:], "Speedtest")
+	return s.probe(ctx, echoTimes, echoFreq, callback, func(probeCtx context.Context) error {
+		packet[2], packet[3] = 0, 0
+		packet[7]++
+		checksum := checkSum(packet)
+		packet[2], packet[3] = byte(checksum>>8), byte(checksum)
+		deadline := time.Now().Add(readTimeout)
+		if d, ok := probeCtx.Deadline(); ok && d.Before(deadline) {
+			deadline = d
+		}
+		if err := conn.SetDeadline(deadline); err != nil {
+			return err
+		}
+		if _, err := conn.Write(packet); err != nil {
+			return err
+		}
+		var reply [512]byte
+		n, err := conn.Read(reply[:])
 		if err != nil {
-			failTimes += echoTimes - i
-			break
+			return err
 		}
-		buf := make([]byte, 20+echoOptionDataSize+8)
-		_, err = dialContext.Read(buf)
-		if err != nil || buf[20] != 0x00 {
-			failTimes++
-			continue
+		offset := 0
+		if n > 0 && reply[0]>>4 == 4 {
+			offset = int(reply[0]&15) * 4
 		}
-		endTime := time.Since(sTime)
-		latencies = append(latencies, endTime.Nanoseconds())
-		dbg.Printf("1RTT: %s\n", endTime)
-		if callback != nil {
-			callback(endTime)
+		if n < offset+8 || reply[offset] != 0 || reply[offset+5] != packet[5] || reply[offset+7] != packet[7] {
+			return errors.New("invalid ICMP echo reply")
 		}
-		time.Sleep(echoFreq)
-	}
-	if failTimes == echoTimes {
-		return nil, ErrConnectTimeout
-	}
-	return
+		return nil
+	})
 }
 
 func checkSum(data []byte) uint16 {
 	var sum uint32
-	var length = len(data)
-	var index int
-	for length > 1 {
-		sum += uint32(data[index])<<8 + uint32(data[index+1])
-		index += 2
-		length -= 2
+	for len(data) > 1 {
+		sum += uint32(data[0])<<8 | uint32(data[1])
+		data = data[2:]
 	}
-	if length > 0 {
-		sum += uint32(data[index])
+	if len(data) > 0 {
+		sum += uint32(data[0]) << 8
 	}
-	sum += sum >> 16
-	return uint16(^sum)
+	for sum>>16 != 0 {
+		sum = sum&0xffff + sum>>16
+	}
+	return ^uint16(sum)
 }
 
 func StandardDeviation(vector []int64) (mean, variance, stdDev, min, max int64) {
 	if len(vector) == 0 {
 		return
 	}
-	var sumNum, accumulate int64
-	min = math.MaxInt64
-	max = math.MinInt64
+	var sum, accumulate int64
+	min, max = math.MaxInt64, math.MinInt64
 	for _, value := range vector {
-		sumNum += value
-		if min > value {
+		sum += value
+		if value < min {
 			min = value
 		}
-		if max < value {
+		if value > max {
 			max = value
 		}
 	}
-	mean = sumNum / int64(len(vector))
+	mean = sum / int64(len(vector))
 	for _, value := range vector {
 		accumulate += (value - mean) * (value - mean)
 	}

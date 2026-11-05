@@ -3,159 +3,168 @@ package speedtest
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
-	"runtime"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
 
-func TestHTTPPingRejectsHTTPErrorAfterRedirect(t *testing.T) {
-	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer targetServer.Close()
-
-	redirectServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, targetServer.URL, http.StatusTemporaryRedirect)
-	}))
-	defer redirectServer.Close()
-
-	client := New()
-	target := &Server{URL: redirectServer.URL + "/speedtest/upload.php", Context: client}
-	latencies, err := target.HTTPPing(context.Background(), 1, 0, nil)
-	if !errors.Is(err, ErrConnectTimeout) {
-		t.Fatalf("HTTPPing error is %v, want %v", err, ErrConnectTimeout)
-	}
-	if len(latencies) != 0 {
-		t.Fatalf("HTTPPing returned %d latencies for HTTP 500, want 0", len(latencies))
+func TestHTTPPingRootResponses(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusNotFound, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var requests atomic.Int64
+			node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				if r.URL.Path != "/" || r.URL.RawQuery != "" {
+					t.Errorf("ping URL = %s", r.URL)
+				}
+				w.WriteHeader(status)
+			}))
+			defer node.Close()
+			target := &Server{URL: node.URL + "/speed/doAnalsLoad.do?old=value", Context: New()}
+			var callbacks int
+			latencies, err := target.HTTPPing(context.Background(), 2, 0, func(time.Duration) { callbacks++ })
+			if status >= 500 {
+				if !errors.Is(err, ErrConnectTimeout) || len(latencies) != 0 {
+					t.Fatalf("samples=%v error=%v", latencies, err)
+				}
+			} else if err != nil || len(latencies) != 2 || callbacks != 2 {
+				t.Fatalf("samples=%v callbacks=%d error=%v", latencies, callbacks, err)
+			}
+			if requests.Load() != 2 {
+				t.Fatalf("requests=%d", requests.Load())
+			}
+		})
 	}
 }
 
-func TestHTTPPingAcceptsSuccessfulResponse(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+func TestPingTestPublishesActualProbeCounts(t *testing.T) {
+	var requests atomic.Int64
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}))
-	defer server.Close()
+	defer node.Close()
+	target := &Server{URL: node.URL, Context: New()}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := target.PingTestContext(ctx, func(time.Duration) { cancel() }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v", err)
+	}
+	if target.PacketLoss.Sent != 1 || target.PacketLoss.Max != 1 || target.PacketLoss.Loss() != 0.5 {
+		t.Fatalf("probe summary=%+v", target.PacketLoss)
+	}
+	if target.TestDuration.Ping == nil || target.Latency <= 0 {
+		t.Fatal("partial ping measurements missing")
+	}
+	if _, err := target.HTTPPing(context.Background(), 1, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if target.PacketLoss.Sent != 1 || target.PacketLoss.Max != 1 {
+		t.Fatal("loaded latency probe changed initial summary")
+	}
+}
 
-	client := New()
-	target := &Server{URL: server.URL + "/speedtest/upload.php", Context: client}
-	latencies, err := target.HTTPPing(context.Background(), 1, 0, nil)
+func TestHTTPPingCancellationInterruptsInterval(t *testing.T) {
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer node.Close()
+	target := &Server{URL: node.URL, Context: New()}
+	ctx, cancel := context.WithCancel(context.Background())
+	start := time.Now()
+	samples, err := target.HTTPPing(ctx, 10, time.Hour, func(time.Duration) { cancel() })
+	if !errors.Is(err, context.Canceled) || len(samples) != 1 || time.Since(start) > time.Second {
+		t.Fatalf("samples=%v error=%v duration=%v", samples, err, time.Since(start))
+	}
+}
+
+func TestTCPPingUsesHandshakeAndConfiguredDialer(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("HTTPPing failed: %v", err)
+		t.Fatal(err)
 	}
-	if len(latencies) != 1 {
-		t.Fatalf("HTTPPing returned %d latencies, want 1", len(latencies))
+	defer listener.Close()
+	unexpected := make(chan error, 2)
+	go func() {
+		for i := 0; i < 2; i++ {
+			conn, err := listener.Accept()
+			if err != nil {
+				unexpected <- err
+				return
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+			var data [1]byte
+			n, _ := conn.Read(data[:])
+			_ = conn.Close()
+			if n != 0 {
+				unexpected <- errors.New("TCP ping sent application data")
+			} else {
+				unexpected <- nil
+			}
+		}
+	}()
+	var dials atomic.Int64
+	client := New(WithUserConfig(&UserConfig{Source: "127.0.0.1"}))
+	client.tcpDialer.Control = func(_, _ string, _ syscall.RawConn) error { dials.Add(1); return nil }
+	target := &Server{URL: "http://" + listener.Addr().String() + "/speed/doAnalsLoad.do", Host: listener.Addr().String(), Context: client}
+	samples, err := target.TCPPing(context.Background(), 2, 0, nil)
+	if err != nil || len(samples) != 2 || dials.Load() != 2 {
+		t.Fatalf("samples=%v dials=%d error=%v", samples, dials.Load(), err)
 	}
-}
-
-func TestDownloadRejectsHTTPErrorWithoutCountingBody(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte("error response body"))
-	}))
-	defer server.Close()
-
-	client := New()
-	client.SetNThread(1)
-	client.SetRateCaptureFrequency(time.Millisecond)
-	client.SetCaptureTime(10 * time.Millisecond)
-	target := &Server{URL: server.URL + "/speedtest/upload.php", Context: client}
-	if err := target.DownloadTestContext(context.Background()); err != nil {
-		t.Fatalf("DownloadTestContext failed: %v", err)
-	}
-	if target.DLSpeed != -1 {
-		t.Fatalf("download speed is %v for HTTP 500, want -1", target.DLSpeed)
-	}
-	if downloaded := client.GetTotalDownload(); downloaded != 0 {
-		t.Fatalf("counted %d bytes from HTTP 500 response, want 0", downloaded)
+	for i := 0; i < 2; i++ {
+		if err := <-unexpected; err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
 func TestDownloadTestContext(t *testing.T) {
-	idealSpeed := 0.1 * 8 * float64(runtime.NumCPU()) * 10 / 0.1 // one mockRequest per second with all CPU cores
-	delta := 0.15
-	latency, _ := time.ParseDuration("5ms")
-	server := Server{
-		URL:     "https://dummy.com/upload.php",
-		Latency: latency,
-		Context: defaultClient,
-	}
-
-	server.Context.Reset()
-	server.Context.SetRateCaptureFrequency(time.Millisecond)
-	server.Context.SetCaptureTime(time.Second)
-
-	err := server.downloadTestContext(
-		context.Background(),
-		mockRequest,
-	)
+	client, target, _ := newMeasurementFixture(t)
+	client.SetNThread(1).SetCaptureTime(50 * time.Millisecond).SetRateCaptureFrequency(time.Millisecond)
+	err := target.downloadTestContext(context.Background(), mockRequest)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
-	value := server.Context.GetAvgDownloadRate()
-	if value < idealSpeed*(1-delta) || idealSpeed*(1+delta) < value {
-		t.Errorf("got unexpected server.DLSpeed '%v', expected between %v and %v", value, idealSpeed*(1-delta), idealSpeed*(1+delta))
+	if got := client.GetAvgDownloadRate(); got <= 0 {
+		t.Fatalf("download rate=%v", got)
 	}
-	if server.TestDuration.Download == nil || *server.TestDuration.Download != *server.TestDuration.Total {
-		t.Errorf("can't count test duration, server.TestDuration.Download=%v, server.TestDuration.Total=%v", server.TestDuration.Download, server.TestDuration.Total)
+	if target.TestDuration.Download == nil || *target.TestDuration.Download != *target.TestDuration.Total {
+		t.Fatal("download duration missing")
 	}
 }
 
 func TestUploadTestContext(t *testing.T) {
-	idealSpeed := 0.1 * 8 * 1 * 10 / 0.1 // upload test is explicitly single-threaded below
-	delta := 0.15                        // tolerance scope (-0.05, +0.05)
-
-	latency, _ := time.ParseDuration("5ms")
-	server := Server{
-		URL:     "https://dummy.com/upload.php",
-		Latency: latency,
-		Context: defaultClient,
-	}
-
-	server.Context.Reset()
-	server.Context.SetRateCaptureFrequency(time.Millisecond)
-	server.Context.SetCaptureTime(time.Second)
-	server.Context.SetNThread(1)
-
-	err := server.uploadTestContext(
-		context.Background(),
-		mockRequest,
-	)
+	client, target, _ := newMeasurementFixture(t)
+	client.SetNThread(1).SetCaptureTime(50 * time.Millisecond).SetRateCaptureFrequency(time.Millisecond)
+	err := target.uploadTestContext(context.Background(), mockRequest)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
-	value := server.Context.GetAvgUploadRate()
-	if value < idealSpeed*(1-delta) || idealSpeed*(1+delta) < value {
-		t.Errorf("got unexpected server.ULSpeed '%v', expected between %v and %v", value, idealSpeed*(1-delta), idealSpeed*(1+delta))
+	if got := client.GetAvgUploadRate(); got <= 0 {
+		t.Fatalf("upload rate=%v", got)
 	}
-	if server.TestDuration.Upload == nil || *server.TestDuration.Upload != *server.TestDuration.Total {
-		t.Errorf("can't count test duration, server.TestDuration.Upload=%v, server.TestDuration.Total=%v", server.TestDuration.Upload, server.TestDuration.Total)
+	if target.TestDuration.Upload == nil || *target.TestDuration.Upload != *target.TestDuration.Total {
+		t.Fatal("upload duration missing")
 	}
 }
 
-func mockRequest(ctx context.Context, s *Server, w int) error {
-	dc := s.Context.NewChunk()
-	// (0.1MegaByte * 8bit * nConn * 10loop) / 0.1s = n*80Megabit
-	// sleep has bad deviation on windows
-	// ref https://github.com/golang/go/issues/44343
-	dc.GetParent().AddTotalDownload(1 * 1000 * 1000)
-	dc.GetParent().AddTotalUpload(1 * 1000 * 1000)
-	time.Sleep(time.Millisecond * 100)
-	return nil
+func mockRequest(ctx context.Context, s *Server, _ int) error {
+	s.Context.AddTotalDownload(1000)
+	s.Context.AddTotalUpload(1000)
+	return waitProbe(ctx, 5*time.Millisecond)
 }
 
 func TestPautaFilter(t *testing.T) {
-	//vector := []float64{6, 6, 6, 6, 6, 6, 6, 6, 6, 6}
-	vector0 := []int64{26, 23, 32}
-	vector1 := []int64{3, 4, 5, 6, 6, 6, 1, 7, 9, 5, 200}
-	_, _, std, _, _ := StandardDeviation(vector0)
+	_, _, std, _, _ := StandardDeviation([]int64{26, 23, 32})
 	if std != 3 {
-		t.Fail()
+		t.Fatalf("standard deviation=%d", std)
 	}
-
-	result := pautaFilter(vector1)
-	if len(result) != 10 {
-		t.Fail()
+	if got := pautaFilter([]int64{3, 4, 5, 6, 6, 6, 1, 7, 9, 5, 200}); len(got) != 10 {
+		t.Fatalf("filtered=%v", got)
 	}
 }

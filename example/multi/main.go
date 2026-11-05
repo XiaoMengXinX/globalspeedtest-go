@@ -4,22 +4,26 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 
-	"github.com/showwin/speedtest-go/speedtest"
+	"github.com/XiaoMengXinX/globalspeedtest-go/speedtest"
 )
 
 func main() {
-	serverList, _ := speedtest.FetchServers()
-	targets, _ := serverList.FindServer([]int{})
-
-	if len(targets) > 0 {
-		// Use s as main server and use targets as auxiliary servers.
-		// The main server is loaded at a greater proportion than the auxiliary servers.
-		s := targets[0]
-		checkError(s.MultiDownloadTestContext(context.TODO(), targets))
-		checkError(s.MultiUploadTestContext(context.TODO(), targets))
-		fmt.Printf("Download: %s, Upload: %s\n", s.DLSpeed, s.ULSpeed)
+	ctx := context.Background()
+	client := speedtest.New()
+	client.SetCaptureTime(10 * time.Second)
+	servers, err := client.FetchServerListContext(ctx)
+	checkError(err)
+	available := servers.Available()
+	if len(*available) == 0 {
+		log.Fatal("no available servers")
 	}
+	targets := (*available)[:min(3, len(*available))]
+	server := targets[0]
+	checkError(server.MultiDownloadTestContext(ctx, targets))
+	checkError(server.MultiUploadTestContext(ctx, targets))
+	fmt.Printf("Download: %s, Upload: %s\n", server.DLSpeed, server.ULSpeed)
 }
 
 func checkError(err error) {

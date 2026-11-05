@@ -2,8 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"strings"
 	"sync"
 )
 
@@ -117,21 +115,4 @@ func (t *Task) Println(message string) {
 
 func (t *Task) Printf(format string, a ...interface{}) {
 	t.Update(fmt.Sprintf(format, a...))
-}
-
-func (t *Task) CheckError(err error) {
-	if err == nil {
-		return
-	}
-
-	message := fmt.Sprintf("Fatal: %s, err: %v", strings.ToLower(t.title), err)
-	if t.handle != nil {
-		t.handle.Update(message)
-		t.handle.Error()
-	}
-	if t.manager.silent {
-		_, _ = fmt.Fprintln(os.Stderr, message)
-	}
-	t.manager.stopRenderer()
-	os.Exit(1)
 }

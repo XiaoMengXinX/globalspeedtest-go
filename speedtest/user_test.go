@@ -1,50 +1,21 @@
 package speedtest
 
-import (
-	"strconv"
-	"strings"
-	"testing"
-)
+import "testing"
 
 func TestFetchUserInfo(t *testing.T) {
-	client := New()
-
+	client, _ := discoveryFixture(t)
 	user, err := client.FetchUserInfo()
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
-	if user == nil {
-		t.Error("empty user info")
-		return
+	if user.IP != "192.0.2.10" || user.Province != "测试省" || user.City != "测试市" || user.Operator != "测试运营商" || user.Isp != user.Operator {
+		t.Fatalf("unexpected user: %+v", user)
 	}
-	// IP
-	if len(user.IP) < 7 || len(user.IP) > 15 {
-		t.Errorf("invalid IP length. got: %v;", user.IP)
+	if user.Lat != "" || user.Lon != "" {
+		t.Fatalf("unexpected coordinates: %+v", user)
 	}
-	if strings.Count(user.IP, ".") != 3 {
-		t.Errorf("invalid IP format. got: %v", user.IP)
-	}
-
-	// Lat
-	lat, err := strconv.ParseFloat(user.Lat, 64)
-	if err != nil {
-		t.Error(err)
-	}
-	if lat < -90 || 90 < lat {
-		t.Errorf("invalid Latitude. got: %v, expected between -90 and 90", user.Lat)
-	}
-
-	// Lon
-	lon, err := strconv.ParseFloat(user.Lon, 64)
-	if err != nil {
-		t.Error(err)
-	}
-	if lon < -180 || 180 < lon {
-		t.Errorf("invalid Longitude. got: %v, expected between -180 and 180", user.Lon)
-	}
-
-	// Isp
-	if len(user.Isp) == 0 {
-		t.Errorf("invalid Iso. got: %v;", user.Isp)
+	cached, err := client.FetchUserInfo()
+	if err != nil || cached != user || client.User != user {
+		t.Fatalf("cached user: %v, %v", cached, err)
 	}
 }

@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	"github.com/showwin/speedtest-go/speedtest"
+	"github.com/XiaoMengXinX/globalspeedtest-go/speedtest"
 )
 
 func TestFormatUserInfo(t *testing.T) {

@@ -9,13 +9,7 @@ import (
 )
 
 func TestFetchServerList(t *testing.T) {
-	client := New()
-	client.User = &User{
-		IP:  "111.111.111.111",
-		Lat: "35.22",
-		Lon: "138.44",
-		Isp: "Hello",
-	}
+	client, _ := discoveryFixture(t)
 	servers, err := client.FetchServers()
 	if err != nil {
 		t.Error(err)
@@ -144,13 +138,14 @@ func TestCustomServer(t *testing.T) {
 		t.Error("empty server")
 		return
 	}
-	if got.Host != "example.com" {
+	if got.Host != "example.com:443" || got.URL != "https://example.com:443/speed/doAnalsLoad.do" || got.Distance != -1 {
 		t.Error("did not properly set the Host field on a custom server")
 	}
 }
 
 func TestFetchServerByID(t *testing.T) {
-	remoteList, err := FetchServers()
+	client, _ := discoveryFixture(t)
+	remoteList, err := client.FetchServers()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +163,7 @@ func TestFetchServerByID(t *testing.T) {
 	}
 
 	for id, b := range testData {
-		server, err := FetchServerByID(id)
+		server, err := client.FetchServerByID(id)
 		if err != nil && b {
 			t.Error(err)
 		}

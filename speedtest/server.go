@@ -3,11 +3,10 @@ package speedtest
 import (
 	"context"
 	"encoding/json"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"math"
-	"net/http"
+	"net"
 	"net/url"
 	"sort"
 	"strconv"
@@ -15,21 +14,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/showwin/speedtest-go/speedtest/transport"
+	"github.com/XiaoMengXinX/globalspeedtest-go/speedtest/caict"
+	"github.com/XiaoMengXinX/globalspeedtest-go/speedtest/transport"
 )
 
-const (
-	speedTestServersUrl            = "https://www.speedtest.net/api/js/servers"
-	speedTestServersAlternativeUrl = "https://www.speedtest.net/speedtest-servers-static.php"
-	speedTestServersAdvanced       = "https://www.speedtest.net/api/ios-config.php"
-)
+const dataPlanePath = "/speed/doAnalsLoad.do"
 
-type payloadType int
-
-const (
-	typeJSONPayload payloadType = iota
-	typeXMLPayload
-)
+type registryLookup struct {
+	done    chan struct{}
+	servers Servers
+	err     error
+}
 
 var (
 	ErrServerNotFound = errors.New("no server available or found")
@@ -56,6 +51,10 @@ type Server struct {
 	CC           string          `json:"cc"`
 	PacketLoss   transport.PLoss `json:"packet_loss"`
 
+	Province string `json:"province,omitempty"`
+	City     string `json:"city,omitempty"`
+	Operator string `json:"operator,omitempty"`
+
 	Context *Speedtest `json:"-"`
 }
 
@@ -75,27 +74,35 @@ func CustomServer(host string) (*Server, error) {
 // CustomServer given a URL string, return a new Server object, with as much
 // filled in as we can
 func (s *Speedtest) CustomServer(host string) (*Server, error) {
+	if !strings.Contains(host, "://") {
+		host = "http://" + host
+	}
 	u, err := url.Parse(host)
 	if err != nil {
 		return nil, err
 	}
-	u.Path = "/speedtest/upload.php"
-	parseHost := u.String()
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil {
+		return nil, errors.New("invalid node URL")
+	}
+	port := u.Port()
+	if port == "" {
+		port = "80"
+		if u.Scheme == "https" {
+			port = "443"
+		}
+	}
+	if !validNodeHost(u.Hostname()) || !validNodePort(port) {
+		return nil, errors.New("invalid node address")
+	}
+	u.Host = net.JoinHostPort(u.Hostname(), port)
+	u.Path, u.RawPath, u.RawQuery, u.Fragment = dataPlanePath, "", "", ""
 	return &Server{
-		ID:      "Custom",
-		Lat:     "?",
-		Lon:     "?",
-		Country: "?",
-		URL:     parseHost,
-		Name:    u.Host,
-		Host:    u.Host,
-		Sponsor: "?",
-		Context: s,
+		ID: "Custom", URL: u.String(), Name: u.Host, Host: u.Host,
+		Sponsor: "?", Distance: -1, Context: s,
 	}, nil
 }
 
-// ServerList list of Server
-// Users(Client) also exists with @param speedTestServersAdvanced
+// ServerList contains servers and optional client information.
 type ServerList struct {
 	Servers []*Server `xml:"servers>server"`
 	Users   []User    `xml:"client"`
@@ -174,7 +181,10 @@ func (servers Servers) Hosts() []string {
 
 // Less compares the distance. For sorting servers.
 func (b ByDistance) Less(i, j int) bool {
-	return b.Servers[i].Distance < b.Servers[j].Distance
+	if b.Servers[i].Distance < 0 {
+		return false
+	}
+	return b.Servers[j].Distance < 0 || b.Servers[i].Distance < b.Servers[j].Distance
 }
 
 // FetchServerByID retrieves a server by given serverID.
@@ -189,39 +199,26 @@ func FetchServerByID(serverID string) (*Server, error) {
 
 // FetchServerByIDContext retrieves a server by given serverID, observing the given context.
 func (s *Speedtest) FetchServerByIDContext(ctx context.Context, serverID string) (*Server, error) {
-	u, err := url.Parse(speedTestServersAdvanced)
+	servers, err := s.fetchRegistry(ctx)
 	if err != nil {
 		return nil, err
 	}
-	query := u.Query()
-	query.Set(strings.ToLower("serverID"), serverID)
-	u.RawQuery = query.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	for _, server := range servers {
+		if server.ID == serverID {
+			copy := *server
+			return &copy, nil
+		}
+	}
+	servers, err = s.embeddedServers()
 	if err != nil {
 		return nil, err
 	}
-	resp, err := s.doer.Do(req)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	defer func() { _ = resp.Body.Close() }()
-	var list ServerList
-	decoder := xml.NewDecoder(resp.Body)
-	if err = decoder.Decode(&list); err != nil {
-		return nil, err
-	}
-
-	for i := range list.Servers {
-		if list.Servers[i].ID == serverID {
-			list.Servers[i].Context = s
-			if len(list.Users) > 0 {
-				sLat, _ := strconv.ParseFloat(list.Servers[i].Lat, 64)
-				sLon, _ := strconv.ParseFloat(list.Servers[i].Lon, 64)
-				uLat, _ := strconv.ParseFloat(list.Users[0].Lat, 64)
-				uLon, _ := strconv.ParseFloat(list.Users[0].Lon, 64)
-				list.Servers[i].Distance = distance(sLat, sLon, uLat, uLon)
-			}
-			return list.Servers[i], err
+	for _, server := range servers {
+		if server.ID == serverID {
+			return server, nil
 		}
 	}
 	return nil, ErrServerNotFound
@@ -239,130 +236,303 @@ func FetchServers() (Servers, error) {
 
 // FetchServerListContext retrieves a list of available servers, observing the given context.
 func (s *Speedtest) FetchServerListContext(ctx context.Context) (Servers, error) {
-	u, err := url.Parse(speedTestServersUrl)
+	registry, err := s.fetchRegistry(ctx)
 	if err != nil {
-		return Servers{}, err
+		return nil, err
 	}
-	query := u.Query()
-	if len(s.config.Keyword) > 0 {
-		query.Set("search", s.config.Keyword)
-	}
-	if s.config.Location != nil {
-		query.Set("lat", strconv.FormatFloat(s.config.Location.Lat, 'f', -1, 64))
-		query.Set("lon", strconv.FormatFloat(s.config.Location.Lon, 'f', -1, 64))
-	}
-
-	u.RawQuery = query.Encode()
-	dbg.Printf("Retrieving servers: %s\n", u.String())
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return Servers{}, err
-	}
-
-	resp, err := s.doer.Do(req)
-	if err != nil {
-		return Servers{}, err
-	}
-
-	_payloadType := typeJSONPayload
-
-	if resp.ContentLength == 0 {
-		_ = resp.Body.Close()
-
-		req, err = http.NewRequestWithContext(ctx, http.MethodGet, speedTestServersAlternativeUrl, nil)
-		if err != nil {
-			return Servers{}, err
+	city, province := s.matchLocation()
+	servers := s.filterNodes(registry, city, province)
+	if len(servers) == 0 && s.hasSearchCriteria(city, province) {
+		embedded, eerr := s.embeddedServers()
+		if eerr != nil {
+			return nil, eerr
 		}
-
-		resp, err = s.doer.Do(req)
-		if err != nil {
-			return Servers{}, err
-		}
-
-		_payloadType = typeXMLPayload
+		servers = s.filterNodes(embedded, city, province)
 	}
-
-	defer func() { _ = resp.Body.Close() }()
-
-	var servers Servers
-
-	switch _payloadType {
-	case typeJSONPayload:
-		// Decode xml
-		decoder := json.NewDecoder(resp.Body)
-
-		if err = decoder.Decode(&servers); err != nil {
-			return servers, err
-		}
-	case typeXMLPayload:
-		var list ServerList
-		// Decode xml
-		decoder := xml.NewDecoder(resp.Body)
-
-		if err = decoder.Decode(&list); err != nil {
-			return servers, err
-		}
-
-		servers = list.Servers
-	default:
-		return servers, errors.New("response payload decoding not implemented")
+	if len(servers) == 0 {
+		return servers, ErrServerNotFound
 	}
-
-	dbg.Printf("Servers Num: %d\n", len(servers))
-	// set doer of server
-	for _, server := range servers {
-		server.Context = s
+	user, _ := s.FetchUserInfoContext(ctx)
+	score := func(server *Server) int {
+		n := 0
+		if user != nil {
+			if server.Province == user.Province {
+				n += 1
+			}
+			if server.Operator == user.Operator {
+				n += 2
+			}
+			if server.City == user.City {
+				n += 4
+			}
+		}
+		return n
 	}
-
-	// ping once
+	sort.SliceStable(servers, func(i, j int) bool { return score(servers[i]) > score(servers[j]) })
+	if len(servers) > 20 {
+		servers = servers[:20]
+	}
+	pCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
 	var wg sync.WaitGroup
-	pCtx, fc := context.WithTimeout(context.Background(), time.Second*4)
-	dbg.Println("Echo each server...")
 	for _, server := range servers {
 		wg.Add(1)
 		go func(gs *Server) {
+			defer wg.Done()
 			var latency []int64
-			var errPing error
+			var err error
 			switch s.config.PingMode {
 			case TCP:
-				latency, errPing = gs.TCPPing(pCtx, 1, time.Millisecond, nil)
+				latency, err = gs.TCPPing(pCtx, 1, time.Millisecond, nil)
 			case ICMP:
-				latency, errPing = gs.ICMPPing(pCtx, 4*time.Second, 1, time.Millisecond, nil)
+				latency, err = gs.ICMPPing(pCtx, 4*time.Second, 1, time.Millisecond, nil)
 			default:
-				latency, errPing = gs.HTTPPing(pCtx, 1, time.Millisecond, nil)
+				latency, err = gs.HTTPPing(pCtx, 1, time.Millisecond, nil)
 			}
-			if errPing != nil || len(latency) < 1 {
-				gs.Latency = PingTimeout
-			} else {
-				gs.Latency = time.Duration(latency[0]) * time.Nanosecond
+			gs.Latency = PingTimeout
+			if err == nil && len(latency) > 0 {
+				gs.Latency = time.Duration(latency[0])
 			}
-			wg.Done()
 		}(server)
 	}
 	wg.Wait()
-	fc()
-
-	// Calculate distance
-	// If we don't call FetchUserInfo() before FetchServers(),
-	// we don't calculate the distance, instead we use the
-	// remote computing distance provided by Ookla as default.
-	if s.User != nil {
-		for _, server := range servers {
-			sLat, _ := strconv.ParseFloat(server.Lat, 64)
-			sLon, _ := strconv.ParseFloat(server.Lon, 64)
-			uLat, _ := strconv.ParseFloat(s.User.Lat, 64)
-			uLon, _ := strconv.ParseFloat(s.User.Lon, 64)
-			server.Distance = distance(sLat, sLon, uLat, uLon)
-		}
-	}
-
-	// Sort by distance
-	sort.Sort(ByDistance{servers})
-
-	if len(servers) <= 0 {
-		return servers, ErrServerNotFound
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return servers, nil
+}
+
+// hasSearchCriteria reports whether the user asked for specific nodes rather
+// than location-based recommendations. Such queries fall back to the embedded
+// nationwide table when the live feed, which is narrowed to the caller's
+// region, cannot satisfy them.
+func (s *Speedtest) hasSearchCriteria(city, province string) bool {
+	return s.config.Keyword != "" || province != "" || city != "" || s.config.Operator != ""
+}
+
+func (s *Speedtest) filterNodes(nodes Servers, city, province string) Servers {
+	var out Servers
+	for _, node := range nodes {
+		if s.config.Operator != "" && !strings.Contains(node.Operator, s.config.Operator) {
+			continue
+		}
+		if province != "" && !strings.Contains(node.Province, province) {
+			continue
+		}
+		if city != "" && !strings.Contains(strings.ToLower(node.City+node.Name), strings.ToLower(city)) {
+			continue
+		}
+		if keyword := strings.ToLower(s.config.Keyword); keyword != "" &&
+			!strings.Contains(strings.ToLower(node.ID+" "+node.Name+" "+node.Province+" "+node.City+" "+node.Operator+" "+node.Host), keyword) {
+			continue
+		}
+		copy := *node
+		out = append(out, &copy)
+	}
+	return out
+}
+
+func validNodePort(port string) bool {
+	n, err := strconv.Atoi(port)
+	return err == nil && n > 0 && n <= 65535
+}
+
+func validNodeHost(host string) bool {
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(strings.TrimSuffix(host, "."), ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if r != '-' && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (s *Speedtest) nodeServer(node caict.Server) *Server {
+	host := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(node.HostIP), "["), "]")
+	if node.HostID == "" || node.HostName == "" || !validNodeHost(host) || !validNodePort(node.Port) {
+		return nil
+	}
+	addr := net.JoinHostPort(host, node.Port)
+	return &Server{
+		ID: node.HostID, Name: node.HostName, Host: addr,
+		URL:     (&url.URL{Scheme: "http", Host: addr, Path: dataPlanePath}).String(),
+		Country: "中国", CC: "CN", Sponsor: node.Oper, Operator: node.Oper,
+		Province: node.PName, City: node.Location, Distance: -1, Context: s,
+	}
+}
+
+func (s *Speedtest) embeddedServers() (Servers, error) {
+	list, err := caict.EmbeddedServerList()
+	if err != nil {
+		return nil, err
+	}
+	var servers Servers
+	for _, node := range list.Servers {
+		if server := s.nodeServer(node); server != nil {
+			servers = append(servers, server)
+		}
+	}
+	return dedupeServers(servers), nil
+}
+
+func dedupeServers(servers Servers) Servers {
+	ids, hosts := make(map[string]bool), make(map[string]bool)
+	out := make(Servers, 0, len(servers))
+	for _, server := range servers {
+		if ids[server.ID] || hosts[server.Host] {
+			continue
+		}
+		ids[server.ID], hosts[server.Host] = true, true
+		out = append(out, server)
+	}
+	return out
+}
+
+func (s *Speedtest) matchLocation() (city, province string) {
+	province = s.config.Province
+	city = s.config.CityFlag
+	if s.config.Location != nil && city == "" {
+		city = s.config.Location.Name
+		if strings.HasPrefix(city, "Custom-") {
+			city = ""
+		}
+	}
+	switch strings.ToLower(city) {
+	case "beijing":
+		city = "北京"
+	case "shanghai":
+		city = "上海"
+	case "hongkong":
+		city = "香港"
+	case "urumqi":
+		city = "乌鲁木齐"
+		if province == "" {
+			province = "新疆"
+		}
+	}
+	if province == "" && (city == "北京" || city == "上海" || city == "香港") {
+		province = city
+	}
+	return city, province
+}
+
+func (s *Speedtest) liveServers(ctx context.Context) (Servers, error) {
+	user, _ := s.FetchUserInfoContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	v := url.Values{
+		"ip": {""}, "network": {"4"}, "province": {""}, "city": {""},
+		"wifioper": {""}, "mobileoperid": {""}, "ipv6": {"0"},
+		"model": {"iphone"}, "pkg": {caict.DefaultPkg},
+	}
+	if user != nil {
+		v.Set("ip", user.IP)
+		v.Set("province", user.Province)
+		v.Set("city", user.City)
+		v.Set("wifioper", user.Operator)
+		if ip := net.ParseIP(user.IP); ip != nil && ip.To4() == nil {
+			v.Set("ipv6", "1")
+		}
+	}
+	city, province := s.matchLocation()
+	if city != "" {
+		v.Set("city", city)
+	}
+	if province != "" {
+		v.Set("province", province)
+	}
+	if s.config.Operator != "" {
+		v.Set("wifioper", s.config.Operator)
+	}
+	body, err := s.controlGet(ctx, "/dataServer/mobilematch_many.php", v)
+	if err != nil {
+		return nil, err
+	}
+	var nodes []map[string]json.RawMessage
+	if err := json.Unmarshal(body, &nodes); err != nil {
+		return nil, err
+	}
+	var servers Servers
+	for _, node := range nodes {
+		text := func(key string) string {
+			var str string
+			if json.Unmarshal(node[key], &str) == nil {
+				return strings.TrimSpace(str)
+			}
+			var n json.Number
+			if json.Unmarshal(node[key], &n) == nil {
+				return n.String()
+			}
+			return ""
+		}
+		oper := text("oper")
+		if oper == "" {
+			oper = v.Get("wifioper")
+		}
+		city := text("city")
+		if city == "" {
+			city = text("location")
+		}
+		server := s.nodeServer(caict.Server{
+			HostID: text("hostid"), HostName: text("hostname"), HostIP: text("hostip"),
+			Port: text("port"), PName: text("pname"), Location: city, Oper: oper,
+		})
+		if server != nil {
+			servers = append(servers, server)
+		}
+	}
+	return dedupeServers(servers), nil
+}
+
+func (s *Speedtest) fetchRegistry(ctx context.Context) (Servers, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.userMu.Lock()
+	lookup := s.registry
+	if lookup != nil {
+		s.userMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-lookup.done:
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return lookup.servers, lookup.err
+		}
+	}
+	lookup = &registryLookup{done: make(chan struct{})}
+	s.registry = lookup
+	s.userMu.Unlock()
+	servers, err := s.liveServers(ctx)
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	} else if err != nil || len(servers) == 0 {
+		servers, err = s.embeddedServers()
+	}
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	s.userMu.Lock()
+	lookup.servers, lookup.err = servers, err
+	if s.registry == lookup && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		s.registry = nil
+	}
+	close(lookup.done)
+	s.userMu.Unlock()
+	return servers, err
 }
 
 // FetchServerListContext retrieves a list of available servers, observing the given context.
@@ -443,10 +613,14 @@ func (s *Server) String() string {
 	if s.Sponsor == "?" {
 		return fmt.Sprintf("[%4s] %s", s.ID, s.Name)
 	}
-	if len(s.Country) == 0 {
-		return fmt.Sprintf("[%4s] %.2fkm %s by %s", s.ID, s.Distance, s.Name, s.Sponsor)
+	distance := ""
+	if s.Distance >= 0 {
+		distance = fmt.Sprintf("%.2fkm ", s.Distance)
 	}
-	return fmt.Sprintf("[%4s] %.2fkm %s (%s) by %s", s.ID, s.Distance, s.Name, s.Country, s.Sponsor)
+	if len(s.Country) == 0 {
+		return fmt.Sprintf("[%4s] %s%s by %s", s.ID, distance, s.Name, s.Sponsor)
+	}
+	return fmt.Sprintf("[%4s] %s%s (%s) by %s", s.ID, distance, s.Name, s.Country, s.Sponsor)
 }
 
 // CheckResultValid checks that results are logical given UL and DL speeds

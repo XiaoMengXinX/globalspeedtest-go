@@ -40,6 +40,20 @@ builds:
       - softfloat
     ldflags:
       - -s -w -X main.version={{.Version}} -X main.commit={{.ShortCommit}} -X main.date={{ .CommitDate }}
+upx:
+  # UPX cannot pack the BSD, macOS, s390x, ppc64*, riscv64, loong64 and
+  # mips64* targets, so pack only the Linux and Windows architectures it
+  # supports and leave the rest as plain binaries.
+  - enabled: true
+    goos: [linux]
+    goarch: [amd64, '386', arm, arm64]
+    compress: best
+    lzma: true
+  - enabled: true
+    goos: [windows]
+    goarch: [amd64, '386']
+    compress: best
+    lzma: true
 archives:
   - name_template: >-
       {{ .ProjectName }}_{{ .Version }}_{{ if eq .Os "openbsd" }}OpenBSD{{ else }}{{ title .Os }}{{ end }}_{{ if eq .Arch "386" }}i386{{ else if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}{{ with .Arm }}v{{ . }}{{ end }}{{ with .Mips }}_{{ . }}{{ end }}{{ if not (eq .Amd64 "v1") }}{{ .Amd64 }}{{ end }}
