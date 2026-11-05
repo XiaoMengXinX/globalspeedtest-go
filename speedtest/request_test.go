@@ -153,7 +153,7 @@ func TestUploadTestContext(t *testing.T) {
 	}
 }
 
-func mockRequest(ctx context.Context, s *Server, _ int) error {
+func mockRequest(ctx context.Context, s *Server) error {
 	s.Context.AddTotalDownload(1000)
 	s.Context.AddTotalUpload(1000)
 	return waitProbe(ctx, 5*time.Millisecond)

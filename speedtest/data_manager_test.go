@@ -146,3 +146,37 @@ func TestDataManager_ResetSnapshots(t *testing.T) {
 		t.Fatal("clean retained snapshot history")
 	}
 }
+
+func TestUploadRequestSizeFollowsRequestTime(t *testing.T) {
+	dm := NewDataManager()
+	dm.PrepareUpload()
+	size := dm.UploadRequestSize()
+	if size != minUploadRequestSize {
+		t.Fatalf("initial size = %d", size)
+	}
+	dm.ObserveUploadRequest(size, 100*time.Millisecond)
+	// A second fast request that started at the old size does not grow it again.
+	dm.ObserveUploadRequest(size, 100*time.Millisecond)
+	if got := dm.UploadRequestSize(); got != 2*size {
+		t.Fatalf("after fast requests size = %d, want %d", got, 2*size)
+	}
+	dm.ObserveUploadRequest(2*size, time.Second)
+	if got := dm.UploadRequestSize(); got != 2*size {
+		t.Fatalf("a request within the target changed the size to %d", got)
+	}
+	dm.ObserveUploadRequest(2*size, 3*time.Second)
+	dm.ObserveUploadRequest(size, 5*time.Second)
+	if got := dm.UploadRequestSize(); got != minUploadRequestSize {
+		t.Fatalf("after slow requests size = %d, want the minimum", got)
+	}
+	for range 20 {
+		dm.ObserveUploadRequest(dm.UploadRequestSize(), time.Millisecond)
+	}
+	if got := dm.UploadRequestSize(); got != maxUploadRequestSize {
+		t.Fatalf("size grew to %d, want the maximum", got)
+	}
+	dm.PrepareUpload()
+	if got := dm.UploadRequestSize(); got != minUploadRequestSize {
+		t.Fatalf("a new phase starts at %d", got)
+	}
+}

@@ -27,6 +27,9 @@ type Manager interface {
 	AddTotalDownload(value int64)
 	AddTotalUpload(value int64)
 
+	UploadRequestSize() int64
+	ObserveUploadRequest(size int64, took time.Duration)
+
 	GetAvgDownloadRate() float64
 	GetAvgUploadRate() float64
 
@@ -110,6 +113,7 @@ type TestDirection struct {
 	totalDataVolume int64                       // total send/receive data volume
 	totalReadVolume int64                       // upload bytes read into the transport
 	activeWorkers   int32                       // current upload worker limit
+	requestSize     int64                       // upload payload size for the next request
 	maxWorkers      int32                       // configured upload worker limit
 	RateSequence    []int64                     // rate history sequence
 	welford         *internal.Welford           // std/EWMA/mean
@@ -184,6 +188,7 @@ func (td *TestDirection) resetMeasurements() {
 	atomic.StoreInt64(&td.totalDataVolume, 0)
 	atomic.StoreInt64(&td.totalReadVolume, 0)
 	atomic.StoreInt32(&td.activeWorkers, 0)
+	atomic.StoreInt64(&td.requestSize, minUploadRequestSize)
 	atomic.StoreInt32(&td.maxWorkers, 0)
 	td.RateSequence = nil
 	td.welford = nil
@@ -504,6 +509,41 @@ func (dm *DataManager) GetTotalDownload() int64 {
 
 func (dm *DataManager) GetTotalUpload() int64 {
 	return dm.upload.GetTotalDataVolume()
+}
+
+// Upload request payloads follow the uplink so that each request completes in
+// about a second: small enough for a weak uplink to confirm bytes within the
+// measurement, large enough that a fast one is not bound by the new connection
+// every request opens.
+const (
+	minUploadRequestSize = 4 << 10
+	maxUploadRequestSize = 4 << 20
+	uploadRequestFast    = 500 * time.Millisecond
+	uploadRequestSlow    = 2 * time.Second
+)
+
+// UploadRequestSize returns the payload size for the next upload request.
+func (dm *DataManager) UploadRequestSize() int64 {
+	return atomic.LoadInt64(&dm.upload.requestSize)
+}
+
+// ObserveUploadRequest adapts the request size to a confirmed request of size
+// bytes that took the given time.
+func (dm *DataManager) ObserveUploadRequest(size int64, took time.Duration) {
+	td := dm.upload
+	switch {
+	case took < uploadRequestFast:
+		// Requests in flight started at the same size; the first to finish grows it.
+		atomic.CompareAndSwapInt64(&td.requestSize, size, min(size*2, maxUploadRequestSize))
+	case took > uploadRequestSlow:
+		next := max(size/2, minUploadRequestSize)
+		for {
+			current := atomic.LoadInt64(&td.requestSize)
+			if current <= next || atomic.CompareAndSwapInt64(&td.requestSize, current, next) {
+				return
+			}
+		}
+	}
 }
 
 // GetUploadBacklog returns upload bytes read by the transport but not yet

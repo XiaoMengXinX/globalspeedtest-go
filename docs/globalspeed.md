@@ -51,7 +51,7 @@ GET /speed/File(1G).dl?r={签发时的 unixSeconds}&key={UUID}
 
 节点按出口 IP 维护会话状态。若某节点此前收到过畸形请求，它会对该出口 IP 持续以 dovalid `-1-` 或下载 403 回应，直到状态过期或出口 IP 变化。换用其他节点或出口即可正常签发与下载。
 
-上传使用 `POST /speed/doAnalsLoad.do`，请求头 `Key` 携带 UUID。正文为 multipart，boundary 为 `00content0boundary00`，文件字段为 `upload`，文件名以 `SPEED_` 开头。每个请求发送有明确长度的正文；成功收到服务器响应后，将该请求的载荷字节计入确认上传量。
+上传使用 `POST /speed/doAnalsLoad.do`，请求头 `Key` 携带 UUID。正文为 multipart，boundary 为 `00content0boundary00`，文件字段为 `upload`，文件名以 `SPEED_` 开头。每个请求发送有明确长度的正文；成功收到服务器响应后，将该请求的载荷字节计入确认上传量。载荷大小随上行速度调整：从 4 KB 起，请求在 0.5 秒内完成则翻倍，超过 2 秒则减半，上限 4 MB，使弱上行也能在测量时限内得到确认字节。
 
 `DataManager` 负责并发、测量时限、采样、回调与总字节统计。公开速率字段采用字节/秒。`Confirmed` 是成功上传请求的载荷字节占已发送载荷的比例。
 

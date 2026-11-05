@@ -23,11 +23,9 @@ import (
 )
 
 type (
-	downloadFunc func(context.Context, *Server, int) error
-	uploadFunc   func(context.Context, *Server, int) error
+	downloadFunc func(context.Context, *Server) error
+	uploadFunc   func(context.Context, *Server) error
 )
-
-var ulSizes = [...]int{100, 300, 500, 800, 1000, 1500, 2500, 3000, 3500, 4000}
 
 var ErrConnectTimeout = errors.New("server connect timeout")
 
@@ -193,7 +191,7 @@ func (s *Server) uploadTestContext(ctx context.Context, request uploadFunc) erro
 	return s.measureContext(ctx, Servers{s}, true, request)
 }
 
-func (s *Server) measureContext(ctx context.Context, servers Servers, upload bool, request func(context.Context, *Server, int) error) (result error) {
+func (s *Server) measureContext(ctx context.Context, servers Servers, upload bool, request func(context.Context, *Server) error) (result error) {
 	if s.Context == nil || s.Context.Manager == nil {
 		return ErrorUninitializedManager
 	}
@@ -272,7 +270,7 @@ func (s *Server) measureContext(ctx context.Context, servers Servers, upload boo
 			if phaseCtx.Err() != nil {
 				return
 			}
-			if err := request(requestCtx, &workerServer, 4); err != nil && phaseCtx.Err() == nil {
+			if err := request(requestCtx, &workerServer); err != nil && phaseCtx.Err() == nil {
 				firstError.Do(func() { workerErr = err; cancel() })
 			}
 		}
@@ -292,7 +290,7 @@ func (s *Server) measureContext(ctx context.Context, servers Servers, upload boo
 	return workerErr
 }
 
-func downloadRequest(ctx context.Context, s *Server, _ int) error {
+func downloadRequest(ctx context.Context, s *Server) error {
 	session, ok := ctx.Value(nodeSessionContextKey{}).(nodeSession)
 	if !ok {
 		return errors.New("download session is missing")
@@ -332,15 +330,12 @@ func (b *uploadBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func uploadRequest(ctx context.Context, s *Server, w int) error {
+func uploadRequest(ctx context.Context, s *Server) error {
 	session, ok := ctx.Value(nodeSessionContextKey{}).(nodeSession)
 	if !ok {
 		return errors.New("upload session is missing")
 	}
-	if w < 0 || w >= len(ulSizes) {
-		return errors.New("invalid upload size")
-	}
-	size := int64(ulSizes[w]*100-51) * 10
+	size := s.Context.UploadRequestSize()
 	var framing bytes.Buffer
 	form := multipart.NewWriter(&framing)
 	if err := form.SetBoundary(uploadBoundary); err != nil {
@@ -371,6 +366,7 @@ func uploadRequest(ctx context.Context, s *Server, w int) error {
 	req.Header.Set("User-Agent", nodeUploadUA)
 	req.Header.Set("Accept", "*/*")
 	req.Close = true
+	start := time.Now()
 	resp, err := s.Context.doer.Do(req)
 	if err != nil {
 		return nodeRequestError(err)
@@ -386,6 +382,7 @@ func uploadRequest(ctx context.Context, s *Server, w int) error {
 		return io.ErrUnexpectedEOF
 	}
 	s.Context.AddTotalUpload(size)
+	s.Context.ObserveUploadRequest(size, time.Since(start))
 	return nil
 }
 
