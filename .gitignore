@@ -25,6 +25,7 @@ _testmain.go
 .goxc.local.json
 dist/*
 speedtest-go
+globalspeedtest-go
 
 .idea/
 .run/
